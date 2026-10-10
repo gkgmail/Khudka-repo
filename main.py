@@ -3,7 +3,7 @@ import re
 import time
 import asyncio
 from aiohttp import web
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.errors import FloodWait, ChannelPrivate, ChatAdminRequired, UserNotParticipant
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
@@ -22,6 +22,7 @@ SEMAPHORE = asyncio.Semaphore(2)
 
 # Multi-step batch state storage
 USER_STATES = {}
+USERBOT_ONLINE = False
 
 # --- KOYEB HEALTH CHECK WEB SERVER ---
 async def health_check(request):
@@ -72,7 +73,6 @@ def get_progress_bar(percentage):
 # --- STYLISH LIVE PROGRESS TRACKER ---
 async def progress_bar(current, total, message, start_time, last_update, action_title):
     now = time.time()
-    # 5-second interval Telegram FloodWait se bachne ke liye
     if (now - last_update[0]) < 5.0 and current != total:
         return
     last_update[0] = now
@@ -90,6 +90,7 @@ async def progress_bar(current, total, message, start_time, last_update, action_
 
     card = (
         f"╭━━━━━━━━━━━━━━━━━━━━╮\n"
+        f"┃ 🦅 **VILLAN CLONER** 🦅\n"
         f"┃ ⚡ **{action_title}**\n"
         f"┣━━━━━━━━━━━━━━━━━━━━┫\n"
         f"┃ `[{bar}]` **{percentage:.1f}%**\n"
@@ -105,7 +106,6 @@ async def progress_bar(current, total, message, start_time, last_update, action_
     except Exception:
         pass
 
-# --- LINK PARSER HELPER ---
 def parse_tg_link(link: str):
     regex = r"https://t\.me/(?:c/(\d+)|([a-zA-Z0-9_]+))/(?:(\d+)/)?(\d+)"
     match = re.search(regex, link)
@@ -117,6 +117,10 @@ def parse_tg_link(link: str):
 
 # --- MESSAGE PROCESSING ENGINE ---
 async def process_single_message(client, user_client, target_chat, msg_id, status_msg, chat_id):
+    if not USERBOT_ONLINE:
+        await client.send_message(chat_id, "❌ **Userbot session offline hai!** Koyeb environment me `SESSION_STRING` check karein.")
+        return "BREAK"
+
     file_path = None
     thumb_path = None
     try:
@@ -124,21 +128,18 @@ async def process_single_message(client, user_client, target_chat, msg_id, statu
         if not target_msg or target_msg.empty:
             return False
 
-        # 1. Text Message Cloning
         if not target_msg.media:
             if target_msg.text:
                 await client.send_message(chat_id, target_msg.text)
                 return True
             return False
 
-        # 2. Check 2GB Limit
         media_obj = getattr(target_msg, target_msg.media.value)
         file_size = getattr(media_obj, "file_size", 0)
         if file_size > 2097152000:
-            await client.send_message(chat_id, f"⚠️ **Message {msg_id}:** File 2GB se badi hai (Telegram Bot API limit).")
+            await client.send_message(chat_id, f"⚠️ **Message {msg_id}:** File 2GB se badi hai.")
             return False
 
-        # 3. Media Download
         last_update = [time.time()]
         start_time = time.time()
         file_path = await user_client.download_media(
@@ -153,7 +154,6 @@ async def process_single_message(client, user_client, target_chat, msg_id, statu
             except Exception:
                 thumb_path = None
 
-        # 4. Media Upload
         caption = target_msg.caption or ""
         last_update = [time.time()]
         start_time = time.time()
@@ -202,7 +202,7 @@ async def process_single_message(client, user_client, target_chat, msg_id, statu
         await asyncio.sleep(e.value)
         return False
     except Exception as e:
-        print(f"Error processing {msg_id}: {e}")
+        print(f"Error on {msg_id}: {e}")
         return False
     finally:
         for p in [file_path, thumb_path]:
@@ -212,25 +212,38 @@ async def process_single_message(client, user_client, target_chat, msg_id, statu
                 except OSError:
                     pass
 
-# --- BOT COMMANDS & DIALOGUE LOGIC ---
+# --- VILLAN START COMMAND ---
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message):
-    text = (
-        "🦅 **Welcome to VILLAN Save Restriction Bot** 🦅\n\n"
-        "Main private channels se restricted posts (Videos, PDFs, Audios, Photos, Texts) ko save karne ke liye ready hoon.\n\n"
-        "**Features & Commands:**\n"
-        "• `/batch` - Step-by-step batch extraction shuru karein\n"
-        "• `/cancel` - Active batch request cancel karein\n"
-        "• Direct post link ya range link (`link/10-25`) paste karein\n\n"
-        "⚡ *Fast MTProto engine with Live Speedometer enabled.*"
+    user_status = "🟢 Connected" if USERBOT_ONLINE else "🔴 Disconnected"
+    
+    start_card = (
+        f"╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮\n"
+        f"┃ 🦅 **ᴹᴿ ᴠɪʟʟᴀɪɴ RESTRICTION BOT** 🦅\n"
+        f"┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n"
+        f"┃ ⚡ **Welcome!**\n"
+        f"┃ \n"
+        f"┃ Main private channels se restricted\n"
+        f"┃ content (Video, PDF, Audio, Photo)\n"
+        f"┃ instantly save karne ke liye ready hoon.\n"
+        f"┃ \n"
+        f"┃ ⚙️ **Engine Status:** `{user_status}`\n"
+        f"┃ \n"
+        f"┃ 📌 **Commands:**\n"
+        f"┃ • `/batch`  - Step-by-step range extraction\n"
+        f"┃ • `/cancel` - Active queue stop karne ke liye\n"
+        f"┃ • Direct channel post link paste karein\n"
+        f"┃ \n"
+        f"┃ ⚡ *Ultra-Fast MTProto Engine by VILLAN*\n"
+        f"╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
     )
-    await message.reply_text(text)
+    await message.reply_text(start_card)
 
 @app.on_message(filters.command("cancel") & filters.private)
 async def cancel_handler(client, message):
     if message.chat.id in USER_STATES:
         del USER_STATES[message.chat.id]
-        await message.reply_text("🛑 **Batch process cancel kar diya gaya hai.**")
+        await message.reply_text("🛑 **VILLAN Engine:** Task cancel kar diya gaya hai.")
     else:
         await message.reply_text("Kuch bhi active nahi hai cancel karne ke liye.")
 
@@ -238,21 +251,21 @@ async def cancel_handler(client, message):
 async def batch_start_handler(client, message):
     USER_STATES[message.chat.id] = {"step": "WAITING_FIRST_LINK"}
     await message.reply_text(
-        "🔗 **Batch Extraction - Step 1/2**\n\n"
-        "Kripya **pehla (start) message ka link** send karein jahan se extraction shuru karni hai.\n\n"
-        "*(Process cancel karne ke liye `/cancel` likhein)*"
+        "🔗 **VILLAN Batch System - Step 1/2**\n\n"
+        "Kripya **start message ka link** bhejiye jahan se files extract shuru karni hain.\n\n"
+        "*(Cancel karne ke liye `/cancel` likhein)*"
     )
 
-@app.on_message(filters.text & filters.private)
+@app.on_message(filters.text & filters.private & ~filters.command(["start", "batch", "cancel"]))
 async def message_dispatcher(client, message):
     user_id = message.chat.id
     text = message.text.strip()
 
-    # 1. Batch Step 1: Receiving First Link
+    # Step 1: Receiving Start Link
     if user_id in USER_STATES and USER_STATES[user_id].get("step") == "WAITING_FIRST_LINK":
         chat_id, start_id = parse_tg_link(text)
         if not chat_id or not start_id:
-            await message.reply_text("❌ **Invalid link!** Kripya sahi Telegram post link bhejiye.")
+            await message.reply_text("❌ **Invalid link!** Sahi Telegram channel post link bhejiye.")
             return
 
         USER_STATES[user_id] = {
@@ -261,17 +274,111 @@ async def message_dispatcher(client, message):
             "start_id": start_id
         }
         await message.reply_text(
-            f"✅ **Start Post Locked:** (Message ID: `{start_id}`)\n\n"
-            "🔗 **Batch Extraction - Step 2/2**\n\n"
-            "Ab **aakhiri (last) message ka link** send karein jahan tak files extract karni hain."
+            f"✅ **Start Message Locked:** (ID: `{start_id}`)\n\n"
+            "🔗 **VILLAN Batch System - Step 2/2**\n\n"
+            "Ab **aakhiri (last) message ka link** send karein."
         )
         return
 
-    # 2. Batch Step 2: Receiving Last Link and Executing
+    # Step 2: Receiving End Link and Running Batch
     elif user_id in USER_STATES and USER_STATES[user_id].get("step") == "WAITING_LAST_LINK":
         chat_id, end_id = parse_tg_link(text)
         if not chat_id or not end_id:
-            await message.reply_text("❌ **Invalid link!** Kripya sahi Telegram post link bhejiye.")
+            await message.reply_text("❌ **Invalid link!** Sahi Telegram channel post link bhejiye.")
+            return
+
+        state = USER_STATES.pop(user_id)
+        if state["chat_id"] != chat_id:
+            await message.reply_text("❌ **Mismatched Channels!** Start aur End links ek hi channel ke hone chahiye.")
+            return
+
+        start_id = state["start_id"]
+        if start_id > end_id:
+            start_id, end_id = end_id, start_id
+
+        total_files = end_id - start_id + 1
+        if total_files > 150:
+            await message.reply_text("⚠️ Safety ke liye ek baar mein max 150 posts allow hain.")
+            return
+
+        status_msg = await message.reply_text(
+            f"🦅 **VILLAN Extraction Engine Started!**\n\n"
+            f"📊 **Range:** `{start_id}` se `{end_id}`\n"
+            f"📦 **Total Items:** `{total_files}`"
+        )
+
+        async with SEMAPHORE:
+            for idx, current_id in enumerate(range(start_id, end_id + 1), start=1):
+                await status_msg.edit_text(
+                    f"🔄 **Processing Item `{idx}/{total_files}`**\n"
+                    f"🎯 Message ID: `{current_id}`\n"
+                    f"⏳ Queue fetching..."
+                )
+                res = await process_single_message(client, user, chat_id, current_id, status_msg, user_id)
+                if res == "BREAK":
+                    break
+                await asyncio.sleep(2)
+
+        await status_msg.edit_text("✅ **VILLAN Engine:** Batch extraction complete!")
+        return
+
+    # Direct Single or Dash-Range Link
+    range_regex = r"https://t\.me/(?:c/(\d+)|([a-zA-Z0-9_]+))/(?:(\d+)/)?(\d+)(?:-(\d+))?"
+    match = re.search(range_regex, text)
+    if match:
+        chat_id = int(f"-100{match.group(1)}") if match.group(1) else match.group(2)
+        start_id = int(match.group(4))
+        end_id = int(match.group(5)) if match.group(5) else start_id
+
+        if start_id > end_id:
+            start_id, end_id = end_id, start_id
+
+        total = end_id - start_id + 1
+        if total > 150:
+            await message.reply_text("⚠️ Max 150 messages allow hain ek baar mein.")
+            return
+
+        status_msg = await message.reply_text(f"⏳ **VILLAN Engine:** `{total}` item(s) queue mein hain...")
+
+        async with SEMAPHORE:
+            for idx, current_id in enumerate(range(start_id, end_id + 1), start=1):
+                if total > 1:
+                    await status_msg.edit_text(f"🔄 **Processing Item `{idx}/{total}`** (ID: `{current_id}`)...")
+                res = await process_single_message(client, user, chat_id, current_id, status_msg, user_id)
+                if res == "BREAK":
+                    break
+                if total > 1:
+                    await asyncio.sleep(2)
+
+        await status_msg.delete()
+
+# --- MAIN ASYNC ENGINE ---
+async def main():
+    global USERBOT_ONLINE
+    await start_web_server()
+
+    print("Starting Bot Client...")
+    await app.start()
+    print("Bot Client Online! ✅")
+
+    print("Connecting Userbot Session...")
+    try:
+        await user.start()
+        USERBOT_ONLINE = True
+        print("Userbot Client Connected Successfully! ✅")
+    except Exception as e:
+        USERBOT_ONLINE = False
+        print(f"❌ Userbot connection failed: {e}")
+
+    print("🦅 VILLAN Restricted Bot is Fully LIVE!")
+    await idle()
+    await app.stop()
+    if USERBOT_ONLINE:
+        await user.stop()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+                await message.reply_text("❌ **Invalid link!** Kripya sahi Telegram post link bhejiye.")
             return
 
         state = USER_STATES.pop(user_id)
