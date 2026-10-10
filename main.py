@@ -4,7 +4,12 @@ import time
 import asyncio
 from aiohttp import web
 from pyrogram import Client, filters, idle
-from pyrogram.errors import FloodWait, ChannelPrivate, ChatAdminRequired, UserNotParticipant
+from pyrogram.errors import (
+    FloodWait,
+    ChannelPrivate,
+    ChatAdminRequired,
+    UserNotParticipant,
+)
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -14,8 +19,20 @@ SESSION_STRING = os.environ.get("SESSION_STRING", "")
 PORT = int(os.environ.get("PORT", 8080))
 
 # Pyrogram Clients Setup
-app = Client("bot_service", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workers=16)
-user = Client("user_service", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING, workers=16)
+app = Client(
+    "bot_service",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    workers=16,
+)
+user = Client(
+    "user_service",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION_STRING,
+    workers=16,
+)
 
 # Concurrency lock
 SEMAPHORE = asyncio.Semaphore(2)
@@ -24,9 +41,11 @@ SEMAPHORE = asyncio.Semaphore(2)
 USER_STATES = {}
 USERBOT_ONLINE = False
 
+
 # --- KOYEB HEALTH CHECK WEB SERVER ---
 async def health_check(request):
     return web.Response(text="⚡ VILLAN Restricted Bot is Active!")
+
 
 async def start_web_server():
     server = web.Application()
@@ -36,6 +55,7 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     print(f"Health check running on port {PORT}")
+
 
 # --- FORMATTING UTILITIES ---
 def humanbytes(size):
@@ -49,6 +69,7 @@ def humanbytes(size):
         n += 1
     return f"{size:.2f} {units[n]}"
 
+
 def time_formatter(milliseconds: int) -> str:
     seconds, milliseconds = divmod(int(milliseconds), 1000)
     minutes, seconds = divmod(seconds, 60)
@@ -61,221 +82,8 @@ def time_formatter(milliseconds: int) -> str:
         parts.append(f"{hours}h")
     if minutes:
         parts.append(f"{minutes}m")
-    if seconds:
-        parts.append(f"{seconds}s")
-    return ", ".join(parts) if parts else "0s"
-
-def get_progress_bar(percentage):
-    completed = int(percentage // 10)
-    remaining = 10 - completed
-    return "▰" * completed + "▱" * remaining
-
-# --- STYLISH LIVE PROGRESS TRACKER ---
-async def progress_bar(current, total, message, start_time, last_update, action_title):
-    now = time.time()
-    if (now - last_update[0]) < 5.0 and current != total:
-        return
-    last_update[0] = now
-
-    elapsed_time = max(now - start_time, 0.001)
-    speed = current / elapsed_time
-    percentage = (current * 100 / total) if total > 0 else 0
-    bar = get_progress_bar(percentage)
-
-    remaining_bytes = max(total - current, 0)
-    time_left = round(remaining_bytes / speed) if speed > 0 else 0
-
-    eta = time_formatter(time_left * 1000)
-    elapsed = time_formatter(elapsed_time * 1000)
-
-    card = (
-        f"╭━━━━━━━━━━━━━━━━━━━━╮\n"
-        f"┃ 🦅 **VILLAN CLONER** 🦅\n"
-        f"┃ ⚡ **{action_title}**\n"
-        f"┣━━━━━━━━━━━━━━━━━━━━┫\n"
-        f"┃ `[{bar}]` **{percentage:.1f}%**\n"
-        f"┃ ⚡ **Speed:** `{humanbytes(speed)}/s`\n"
-        f"┃ 💾 **Done:** `{humanbytes(current)} / {humanbytes(total)}`\n"
-        f"┃ 📦 **Left:** `{humanbytes(remaining_bytes)}`\n"
-        f"┃ ⏳ **ETA:** `{eta}`\n"
-        f"┃ ⏱️ **Elapsed:** `{elapsed}`\n"
-        f"╰━━━━━━━━━━━━━━━━━━━━╯"
-    )
-    try:
-        await message.edit_text(card)
-    except Exception:
-        pass
-
-def parse_tg_link(link: str):
-    regex = r"https://t\.me/(?:c/(\d+)|([a-zA-Z0-9_]+))/(?:(\d+)/)?(\d+)"
-    match = re.search(regex, link)
-    if not match:
-        return None, None
-    chat_id = int(f"-100{match.group(1)}") if match.group(1) else match.group(2)
-    message_id = int(match.group(4))
-    return chat_id, message_id
-
-# --- MESSAGE PROCESSING ENGINE ---
-async def process_single_message(client, user_client, target_chat, msg_id, status_msg, chat_id):
-    if not USERBOT_ONLINE:
-        await client.send_message(chat_id, "❌ **Userbot session offline hai!** Koyeb environment me `SESSION_STRING` check karein.")
-        return "BREAK"
-
-    file_path = None
-    thumb_path = None
-    try:
-        target_msg = await user_client.get_messages(target_chat, msg_id)
-        if not target_msg or target_msg.empty:
-            return False
-
-        if not target_msg.media:
-            if target_msg.text:
-                await client.send_message(chat_id, target_msg.text)
-                return True
-            return False
-
-        media_obj = getattr(target_msg, target_msg.media.value)
-        file_size = getattr(media_obj, "file_size", 0)
-        if file_size > 2097152000:
-            await client.send_message(chat_id, f"⚠️ **Message {msg_id}:** File 2GB se badi hai.")
-            return False
-
-        last_update = [time.time()]
-        start_time = time.time()
-        file_path = await user_client.download_media(
-            target_msg,
-            progress=progress_bar,
-            progress_args=(status_msg, start_time, last_update, "📥 Downloading...")
-        )
-
-        if target_msg.video and target_msg.video.thumbs:
-            try:
-                thumb_path = await user_client.download_media(target_msg.video.thumbs[0].file_id)
-            except Exception:
-                thumb_path = None
-
-        caption = target_msg.caption or ""
-        last_update = [time.time()]
-        start_time = time.time()
-
-        if target_msg.video:
-            await client.send_video(
-                chat_id,
-                video=file_path,
-                caption=caption,
-                thumb=thumb_path,
-                duration=target_msg.video.duration,
-                width=target_msg.video.width,
-                height=target_msg.video.height,
-                progress=progress_bar,
-                progress_args=(status_msg, start_time, last_update, "🚀 Uploading Video...")
-            )
-        elif target_msg.document:
-            await client.send_document(
-                chat_id,
-                document=file_path,
-                caption=caption,
-                thumb=thumb_path,
-                progress=progress_bar,
-                progress_args=(status_msg, start_time, last_update, "🚀 Uploading Document...")
-            )
-        elif target_msg.audio:
-            await client.send_audio(
-                chat_id,
-                audio=file_path,
-                caption=caption,
-                duration=target_msg.audio.duration,
-                performer=target_msg.audio.performer,
-                title=target_msg.audio.title,
-                progress=progress_bar,
-                progress_args=(status_msg, start_time, last_update, "🚀 Uploading Audio...")
-            )
-        elif target_msg.photo:
-            await client.send_photo(chat_id, photo=file_path, caption=caption)
-
-        return True
-
-    except (ChannelPrivate, ChatAdminRequired, UserNotParticipant):
-        await client.send_message(chat_id, "❌ **Error:** Userbot account is private channel ka member nahi hai.")
-        return "BREAK"
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
-        return False
-    except Exception as e:
-        print(f"Error on {msg_id}: {e}")
-        return False
-    finally:
-        for p in [file_path, thumb_path]:
-            if p and os.path.exists(p):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
-
-# --- VILLAN START COMMAND ---
-@app.on_message(filters.command("start") & filters.private)
-async def start_handler(client, message):
-    user_status = "🟢 Connected" if USERBOT_ONLINE else "🔴 Disconnected"
     
-    start_card = (
-        f"╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮\n"
-        f"┃ 🦅 **ᴹᴿ ᴠɪʟʟᴀɪɴ RESTRICTION BOT** 🦅\n"
-        f"┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n"
-        f"┃ ⚡ **Welcome!**\n"
-        f"┃ \n"
-        f"┃ Main private channels se restricted\n"
-        f"┃ content (Video, PDF, Audio, Photo)\n"
-        f"┃ instantly save karne ke liye ready hoon.\n"
-        f"┃ \n"
-        f"┃ ⚙️ **Engine Status:** `{user_status}`\n"
-        f"┃ \n"
-        f"┃ 📌 **Commands:**\n"
-        f"┃ • `/batch`  - Step-by-step range extraction\n"
-        f"┃ • `/cancel` - Active queue stop karne ke liye\n"
-        f"┃ • Direct channel post link paste karein\n"
-        f"┃ \n"
-        f"┃ ⚡ *Ultra-Fast MTProto Engine by VILLAN*\n"
-        f"╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
-    )
-    await message.reply_text(start_card)
-
-@app.on_message(filters.command("cancel") & filters.private)
-async def cancel_handler(client, message):
-    if message.chat.id in USER_STATES:
-        del USER_STATES[message.chat.id]
-        await message.reply_text("🛑 **VILLAN Engine:** Task cancel kar diya gaya hai.")
-    else:
-        await message.reply_text("Kuch bhi active nahi hai cancel karne ke liye.")
-
-@app.on_message(filters.command("batch") & filters.private)
-async def batch_start_handler(client, message):
-    USER_STATES[message.chat.id] = {"step": "WAITING_FIRST_LINK"}
-    await message.reply_text(
-        "🔗 **VILLAN Batch System - Step 1/2**\n\n"
-        "Kripya **start message ka link** bhejiye jahan se files extract shuru karni hain.\n\n"
-        "*(Cancel karne ke liye `/cancel` likhein)*"
-    )
-
-@app.on_message(filters.text & filters.private & ~filters.command(["start", "batch", "cancel"]))
-async def message_dispatcher(client, message):
-    user_id = message.chat.id
-    text = message.text.strip()
-
-    # Step 1: Receiving Start Link
-    if user_id in USER_STATES and USER_STATES[user_id].get("step") == "WAITING_FIRST_LINK":
-        chat_id, start_id = parse_tg_link(text)
-        if not chat_id or not start_id:
-            await message.reply_text("❌ **Invalid link!** Sahi Telegram channel post link bhejiye.")
-            return
-
-        USER_STATES[user_id] = {
-            "step": "WAITING_LAST_LINK",
-            "chat_id": chat_id,
-            "start_id": start_id
-        }
-        await message.reply_text(
-            f"✅ **Start Message Locked:** (ID: `{start_id}`)\n\n"
-            "🔗 **VILLAN Batch System - Step 2/2**\n\n"
+    **\n\n"
             "Ab **aakhiri (last) message ka link** send karein."
         )
         return
