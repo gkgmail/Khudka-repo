@@ -15,24 +15,29 @@ from pyrogram.errors import (
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-SESSION_STRING = os.environ.get("SESSION_STRING", "")
+SESSION_STRING = os.environ.get("SESSION_STRING", "").strip()
 PORT = int(os.environ.get("PORT", 8080))
 
-# Pyrogram Clients Setup
+# Pyrogram Clients Setup (in_memory=True taaki Docker session lock na ho)
 app = Client(
     "bot_service",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
+    in_memory=True,
     workers=16,
 )
-user = Client(
-    "user_service",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING,
-    workers=16,
-)
+
+user = None
+if SESSION_STRING and len(SESSION_STRING) > 30:
+    user = Client(
+        "user_service",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        session_string=SESSION_STRING,
+        in_memory=True,
+        workers=16,
+    )
 
 # Concurrency lock
 SEMAPHORE = asyncio.Semaphore(2)
@@ -126,10 +131,8 @@ async def progress_bar(
         f"┃ ⏱️ **Elapsed:** `{elapsed}`",
         "╰━━━━━━━━━━━━━━━━━━━━╯",
     ]
-    card = "\n".join(card_lines)
-
     try:
-        await message.edit_text(card)
+        await message.edit_text("\n".join(card_lines))
     except Exception:
         pass
 
@@ -148,7 +151,7 @@ def parse_tg_link(link: str):
 async def process_single_message(
     client, user_client, target_chat, msg_id, status_msg, chat_id
 ):
-    if not USERBOT_ONLINE:
+    if not USERBOT_ONLINE or not user_client:
         await client.send_message(
             chat_id,
             "❌ **Userbot session offline hai!** Koyeb environment me `SESSION_STRING` check karein.",
@@ -299,8 +302,7 @@ async def start_handler(client, message):
         "┃ ⚡ *Ultra-Fast MTProto Engine by VILLAN*",
         "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯",
     ]
-    start_card = "\n".join(start_lines)
-    await message.reply_text(start_card)
+    await message.reply_text("\n".join(start_lines))
 
 
 @app.on_message(filters.command("cancel") & filters.private)
@@ -331,7 +333,6 @@ async def message_dispatcher(client, message):
     user_id = message.chat.id
     text = message.text.strip()
 
-    # Step 1: Receiving Start Link
     if (
         user_id in USER_STATES
         and USER_STATES[user_id].get("step") == "WAITING_FIRST_LINK"
@@ -355,7 +356,6 @@ async def message_dispatcher(client, message):
         )
         return
 
-    # Step 2: Receiving End Link and Running Batch
     elif (
         user_id in USER_STATES
         and USER_STATES[user_id].get("step") == "WAITING_LAST_LINK"
@@ -408,7 +408,6 @@ async def message_dispatcher(client, message):
         await status_msg.edit_text("✅ **VILLAN Engine:** Batch extraction complete!")
         return
 
-    # Direct Single or Dash-Range Link
     range_regex = (
         r"https://t\.me/(?:c/(\d+)|([a-zA-Z0-9_]+))/(?:(\d+)/)?(\d+)(?:-(\d+))?"
     )
@@ -452,26 +451,34 @@ async def main():
     global USERBOT_ONLINE
     await start_web_server()
 
-    print("Starting Bot Client...")
+    print("Clearing old webhooks and starting Bot Client...")
     await app.start()
+    try:
+        await app.delete_webhook(drop_pending_updates=True)
+        print("Webhook cleared successfully! Long polling active.")
+    except Exception as e:
+        print(f"Webhook cleanup warning: {e}")
+
     print("Bot Client Online! ✅")
 
-    print("Connecting Userbot Session...")
-    try:
-        await user.start()
-        USERBOT_ONLINE = True
-        print("Userbot Client Connected Successfully! ✅")
-    except Exception as e:
-        USERBOT_ONLINE = False
-        print(f"❌ Userbot connection failed: {e}")
+    if user:
+        print("Connecting Userbot Session...")
+        try:
+            await user.start()
+            USERBOT_ONLINE = True
+            print("Userbot Client Connected Successfully! ✅")
+        except Exception as e:
+            USERBOT_ONLINE = False
+            print(f"❌ Userbot connection failed: {e}")
+    else:
+        print("⚠️ SESSION_STRING provide nahi kiya gaya ya chhota hai.")
 
     print("🦅 VILLAN Restricted Bot is Fully LIVE!")
     await idle()
     await app.stop()
-    if USERBOT_ONLINE:
+    if user and USERBOT_ONLINE:
         await user.stop()
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
