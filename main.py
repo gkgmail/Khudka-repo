@@ -82,185 +82,172 @@ def time_formatter(milliseconds: int) -> str:
         parts.append(f"{hours}h")
     if minutes:
         parts.append(f"{minutes}m")
-    
-    **\n\n"
-            "Ab **aakhiri (last) message ka link** send karein."
-        )
+    if seconds:
+        parts.append(f"{seconds}s")
+    return ", ".join(parts) if parts else "0s"
+
+
+def get_progress_bar(percentage):
+    completed = int(percentage // 10)
+    remaining = 10 - completed
+    return "▰" * completed + "▱" * remaining
+
+
+# --- LIVE PROGRESS TRACKER ---
+async def progress_bar(
+    current, total, message, start_time, last_update, action_title
+):
+    now = time.time()
+    if (now - last_update[0]) < 5.0 and current != total:
         return
+    last_update[0] = now
 
-    # Step 2: Receiving End Link and Running Batch
-    elif user_id in USER_STATES and USER_STATES[user_id].get("step") == "WAITING_LAST_LINK":
-        chat_id, end_id = parse_tg_link(text)
-        if not chat_id or not end_id:
-            await message.reply_text("❌ **Invalid link!** Sahi Telegram channel post link bhejiye.")
-            return
+    elapsed_time = max(now - start_time, 0.001)
+    speed = current / elapsed_time
+    percentage = (current * 100 / total) if total > 0 else 0
+    bar = get_progress_bar(percentage)
 
-        state = USER_STATES.pop(user_id)
-        if state["chat_id"] != chat_id:
-            await message.reply_text("❌ **Mismatched Channels!** Start aur End links ek hi channel ke hone chahiye.")
-            return
+    remaining_bytes = max(total - current, 0)
+    time_left = round(remaining_bytes / speed) if speed > 0 else 0
 
-        start_id = state["start_id"]
-        if start_id > end_id:
-            start_id, end_id = end_id, start_id
+    eta = time_formatter(time_left * 1000)
+    elapsed = time_formatter(elapsed_time * 1000)
 
-        total_files = end_id - start_id + 1
-        if total_files > 150:
-            await message.reply_text("⚠️ Safety ke liye ek baar mein max 150 posts allow hain.")
-            return
+    card_lines = [
+        "╭━━━━━━━━━━━━━━━━━━━━╮",
+        "┃ 🦅 **VILLAN CLONER** 🦅",
+        f"┃ ⚡ **{action_title}**",
+        "┣━━━━━━━━━━━━━━━━━━━━┫",
+        f"┃ `[{bar}]` **{percentage:.1f}%**",
+        f"┃ ⚡ **Speed:** `{humanbytes(speed)}/s`",
+        f"┃ 💾 **Done:** `{humanbytes(current)} / {humanbytes(total)}`",
+        f"┃ 📦 **Left:** `{humanbytes(remaining_bytes)}`",
+        f"┃ ⏳ **ETA:** `{eta}`",
+        f"┃ ⏱️ **Elapsed:** `{elapsed}`",
+        "╰━━━━━━━━━━━━━━━━━━━━╯",
+    ]
+    card = "\n".join(card_lines)
 
-        status_msg = await message.reply_text(
-            f"🦅 **VILLAN Extraction Engine Started!**\n\n"
-            f"📊 **Range:** `{start_id}` se `{end_id}`\n"
-            f"📦 **Total Items:** `{total_files}`"
-        )
-
-        async with SEMAPHORE:
-            for idx, current_id in enumerate(range(start_id, end_id + 1), start=1):
-                await status_msg.edit_text(
-                    f"🔄 **Processing Item `{idx}/{total_files}`**\n"
-                    f"🎯 Message ID: `{current_id}`\n"
-                    f"⏳ Queue fetching..."
-                )
-                res = await process_single_message(client, user, chat_id, current_id, status_msg, user_id)
-                if res == "BREAK":
-                    break
-                await asyncio.sleep(2)
-
-        await status_msg.edit_text("✅ **VILLAN Engine:** Batch extraction complete!")
-        return
-
-    # Direct Single or Dash-Range Link
-    range_regex = r"https://t\.me/(?:c/(\d+)|([a-zA-Z0-9_]+))/(?:(\d+)/)?(\d+)(?:-(\d+))?"
-    match = re.search(range_regex, text)
-    if match:
-        chat_id = int(f"-100{match.group(1)}") if match.group(1) else match.group(2)
-        start_id = int(match.group(4))
-        end_id = int(match.group(5)) if match.group(5) else start_id
-
-        if start_id > end_id:
-            start_id, end_id = end_id, start_id
-
-        total = end_id - start_id + 1
-        if total > 150:
-            await message.reply_text("⚠️ Max 150 messages allow hain ek baar mein.")
-            return
-
-        status_msg = await message.reply_text(f"⏳ **VILLAN Engine:** `{total}` item(s) queue mein hain...")
-
-        async with SEMAPHORE:
-            for idx, current_id in enumerate(range(start_id, end_id + 1), start=1):
-                if total > 1:
-                    await status_msg.edit_text(f"🔄 **Processing Item `{idx}/{total}`** (ID: `{current_id}`)...")
-                res = await process_single_message(client, user, chat_id, current_id, status_msg, user_id)
-                if res == "BREAK":
-                    break
-                if total > 1:
-                    await asyncio.sleep(2)
-
-        await status_msg.delete()
-
-# --- MAIN ASYNC ENGINE ---
-async def main():
-    global USERBOT_ONLINE
-    await start_web_server()
-
-    print("Starting Bot Client...")
-    await app.start()
-    print("Bot Client Online! ✅")
-
-    print("Connecting Userbot Session...")
     try:
-        await user.start()
-        USERBOT_ONLINE = True
-        print("Userbot Client Connected Successfully! ✅")
-    except Exception as e:
-        USERBOT_ONLINE = False
-        print(f"❌ Userbot connection failed: {e}")
+        await message.edit_text(card)
+    except Exception:
+        pass
 
-    print("🦅 VILLAN Restricted Bot is Fully LIVE!")
-    await idle()
-    await app.stop()
-    if USERBOT_ONLINE:
-        await user.stop()
 
-if __name__ == "__main__":
-    asyncio.run(main())
-                await message.reply_text("❌ **Invalid link!** Kripya sahi Telegram post link bhejiye.")
-            return
+def parse_tg_link(link: str):
+    regex = r"https://t\.me/(?:c/(\d+)|([a-zA-Z0-9_]+))/(?:(\d+)/)?(\d+)"
+    match = re.search(regex, link)
+    if not match:
+        return None, None
+    chat_id = int(f"-100{match.group(1)}") if match.group(1) else match.group(2)
+    message_id = int(match.group(4))
+    return chat_id, message_id
 
-        state = USER_STATES.pop(user_id)
-        if state["chat_id"] != chat_id:
-            await message.reply_text("❌ **Mismatched Channels!** Start link aur Last link ek hi channel ke hone chahiye.")
-            return
 
-        start_id = state["start_id"]
-        if start_id > end_id:
-            start_id, end_id = end_id, start_id
+# --- MESSAGE PROCESSING ENGINE ---
+async def process_single_message(
+    client, user_client, target_chat, msg_id, status_msg, chat_id
+):
+    if not USERBOT_ONLINE:
+        await client.send_message(
+            chat_id,
+            "❌ **Userbot session offline hai!** Koyeb environment me `SESSION_STRING` check karein.",
+        )
+        return "BREAK"
 
-        total_files = end_id - start_id + 1
-        if total_files > 150:
-            await message.reply_text("⚠️ Safety ke liye ek baar mein maximum 150 messages nikal sakte hain.")
-            return
+    file_path = None
+    thumb_path = None
+    try:
+        target_msg = await user_client.get_messages(target_chat, msg_id)
+        if not target_msg or target_msg.empty:
+            return False
 
-        status_msg = await message.reply_text(
-            f"🚀 **VILLAN Batch Engine Started!**\n\n"
-            f"📊 **Total Range:** `{start_id}` se `{end_id}`\n"
-            f"📦 **Total Items:** `{total_files}`"
+        if not target_msg.media:
+            if target_msg.text:
+                await client.send_message(chat_id, target_msg.text)
+                return True
+            return False
+
+        media_obj = getattr(target_msg, target_msg.media.value)
+        file_size = getattr(media_obj, "file_size", 0)
+        if file_size > 2097152000:
+            await client.send_message(
+                chat_id, f"⚠️ **Message {msg_id}:** File 2GB se badi hai."
+            )
+            return False
+
+        last_update = [time.time()]
+        start_time = time.time()
+        file_path = await user_client.download_media(
+            target_msg,
+            progress=progress_bar,
+            progress_args=(
+                status_msg,
+                start_time,
+                last_update,
+                "📥 Downloading...",
+            ),
         )
 
-        async with SEMAPHORE:
-            for idx, current_id in enumerate(range(start_id, end_id + 1), start=1):
-                await status_msg.edit_text(
-                    f"🔄 **Processing Item `{idx}/{total_files}`**\n"
-                    f"🎯 Message ID: `{current_id}`\n"
-                    f"⏳ Queue fetching..."
+        if target_msg.video and target_msg.video.thumbs:
+            try:
+                thumb_path = await user_client.download_media(
+                    target_msg.video.thumbs[0].file_id
                 )
-                res = await process_single_message(client, user, chat_id, current_id, status_msg, user_id)
-                if res == "BREAK":
-                    break
-                await asyncio.sleep(2)
+            except Exception:
+                thumb_path = None
 
-        await status_msg.edit_text("✅ **Batch Extraction Successfully Complete!**")
-        return
+        caption = target_msg.caption or ""
+        last_update = [time.time()]
+        start_time = time.time()
 
-    # 3. Direct Link Handling (Single Post ya Range Link)
-    range_regex = r"https://t\.me/(?:c/(\d+)|([a-zA-Z0-9_]+))/(?:(\d+)/)?(\d+)(?:-(\d+))?"
-    match = re.search(range_regex, text)
-    if match:
-        chat_id = int(f"-100{match.group(1)}") if match.group(1) else match.group(2)
-        start_id = int(match.group(4))
-        end_id = int(match.group(5)) if match.group(5) else start_id
-
-        if start_id > end_id:
-            start_id, end_id = end_id, start_id
-
-        total = end_id - start_id + 1
-        if total > 150:
-            await message.reply_text("⚠️ Ek baar mein max 150 messages allow hain.")
-            return
-
-        status_msg = await message.reply_text(f"⏳ **Processing `{total}` item(s)...**")
-
-        async with SEMAPHORE:
-            for idx, current_id in enumerate(range(start_id, end_id + 1), start=1):
-                if total > 1:
-                    await status_msg.edit_text(f"🔄 **Processing Item `{idx}/{total}`** (ID: `{current_id}`)...")
-                res = await process_single_message(client, user, chat_id, current_id, status_msg, user_id)
-                if res == "BREAK":
-                    break
-                if total > 1:
-                    await asyncio.sleep(2)
-
-        await status_msg.delete()
-
-# --- MAIN ASYNC ENGINE ---
-async def main():
-    await start_web_server()
-    await user.start()
-    await app.start()
-    print("🦅 VILLAN Restricted Bot is LIVE on Koyeb!")
-    await asyncio.Event().wait()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        if target_msg.video:
+            await client.send_video(
+                chat_id,
+                video=file_path,
+                caption=caption,
+                thumb=thumb_path,
+                duration=target_msg.video.duration,
+                width=target_msg.video.width,
+                height=target_msg.video.height,
+                progress=progress_bar,
+                progress_args=(
+                    status_msg,
+                    start_time,
+                    last_update,
+                    "🚀 Uploading Video...",
+                ),
+            )
+        elif target_msg.document:
+            await client.send_document(
+                chat_id,
+                document=file_path,
+                caption=caption,
+                thumb=thumb_path,
+                progress=progress_bar,
+                progress_args=(
+                    status_msg,
+                    start_time,
+                    last_update,
+                    "🚀 Uploading Document...",
+                ),
+            )
+        elif target_msg.audio:
+            await client.send_audio(
+                chat_id,
+                audio=file_path,
+                caption=caption,
+                duration=target_msg.audio.duration,
+                performer=target_msg.audio.performer,
+                title=target_msg.audio.title,
+                progress=progress_bar,
+                progress_args=(
+                    status_msg,
+                    start_time,
+                    last_update,
+                    "🚀 Uploading Audio...",
+                ),
+            )
+        elif target_msg.photo:
+            await client.
+            
