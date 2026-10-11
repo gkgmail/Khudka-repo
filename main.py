@@ -14,7 +14,7 @@ from pyrogram.errors import (
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 SESSION_STRING = os.environ.get("SESSION_STRING", "").strip()
 PORT = int(os.environ.get("PORT", 8080))
 
@@ -277,6 +277,7 @@ async def process_single_message(
 # --- VILLAN START COMMAND ---
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message):
+    print(f"📩 /start command received from: {message.chat.id}")
     user_status = "🟢 Connected" if USERBOT_ONLINE else "🔴 Disconnected"
 
     start_lines = [
@@ -313,6 +314,7 @@ async def cancel_handler(client, message):
 
 @app.on_message(filters.command("batch") & filters.private)
 async def batch_start_handler(client, message):
+    print(f"📩 /batch command received from: {message.chat.id}")
     USER_STATES[message.chat.id] = {"step": "WAITING_FIRST_LINK"}
     await message.reply_text(
         "🔗 **VILLAN Batch System - Step 1/2**\n\n"
@@ -329,6 +331,7 @@ async def batch_start_handler(client, message):
 async def message_dispatcher(client, message):
     user_id = message.chat.id
     text = message.text.strip()
+    print(f"📩 Text received from {user_id}: {text[:30]}...")
 
     if (
         user_id in USER_STATES
@@ -443,37 +446,35 @@ async def message_dispatcher(client, message):
         await status_msg.delete()
 
 
+# --- BACKGROUND USERBOT CONNECT ---
+async def start_userbot_background():
+    global USERBOT_ONLINE
+    if not user:
+        print("⚠️ SESSION_STRING provide nahi kiya gaya ya 30 chars se chhota hai.")
+        return
+    print("Connecting Userbot Session in background...")
+    try:
+        await user.start()
+        USERBOT_ONLINE = True
+        print("Userbot Client Connected Successfully! ✅")
+    except Exception as e:
+        USERBOT_ONLINE = False
+        print(f"❌ Userbot connection failed: {e}")
+
+
 # --- MAIN ASYNC ENGINE ---
 async def main():
-    global USERBOT_ONLINE
     await start_web_server()
 
-    print("Clearing old webhooks and starting Bot Client...")
+    print("Starting Bot Client...")
     await app.start()
-    try:
-        await app.delete_webhook(drop_pending_updates=True)
-        print("Webhook cleared successfully! Long polling active.")
-    except Exception as e:
-        print(f"Webhook cleanup warning: {e}")
+    bot_info = await app.get_me()
+    print(f"Bot Online as @{bot_info.username}! ✅")
 
-    print("Bot Client Online! ✅")
+    # Userbot background me start hoga taaki main bot client kabhi freeze na ho
+    asyncio.create_task(start_userbot_background())
 
-    if user:
-        print("Connecting Userbot Session (with 10s timeout shield)...")
-        try:
-            await asyncio.wait_for(user.start(), timeout=10.0)
-            USERBOT_ONLINE = True
-            print("Userbot Client Connected Successfully! ✅")
-        except asyncio.TimeoutError:
-            USERBOT_ONLINE = False
-            print("❌ Userbot timeout: Session string interactive login (OTP/Phone) par ruk gayi.")
-        except Exception as e:
-            USERBOT_ONLINE = False
-            print(f"❌ Userbot connection failed: {e}")
-    else:
-        print("⚠️ SESSION_STRING provide nahi kiya gaya ya chhota hai.")
-
-    print("🦅 VILLAN Restricted Bot is Fully LIVE!")
+    print("🦅 VILLAN Restricted Bot is Fully LIVE and listening!")
     await idle()
     await app.stop()
     if user and USERBOT_ONLINE:
@@ -482,3 +483,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
