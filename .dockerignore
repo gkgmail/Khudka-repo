@@ -1,6 +1,12 @@
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
 *.session
 *.session-journal
-downloads/
-.git
+.git/
 .gitignore
+.env
+.dockerignore
+Dockerfile
+README.md
