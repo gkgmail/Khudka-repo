@@ -1,7 +1,13 @@
+
 import os
 import re
 import time
 import asyncio
+import tempfile
+import shutil
+import logging
+from pathlib import Path
+
 from aiohttp import web
 from pyrogram import Client, filters, idle
 from pyrogram.errors import (
@@ -11,14 +17,36 @@ from pyrogram.errors import (
     UserNotParticipant,
 )
 
-# --- CONFIGURATION (Koyeb Environment Variables) ---
+# ==================== KOYEB CONFIG ====================
+
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 SESSION_STRING = os.environ.get("SESSION_STRING", "").strip()
-PORT = int(os.environ.get("PORT", 8080))
+PORT = int(os.environ.get("PORT", "8080"))
 
-# Pyrogram Clients Setup
+# Example: ALLOWED_USER_IDS=123456789,987654321
+_raw_ids = os.environ.get(
+    "ALLOWED_USER_IDS",
+    os.environ.get("OWNER_ID", ""),
+)
+
+try:
+    ALLOWED_USER_IDS = {
+        int(x.strip())
+        for x in _raw_ids.split(",")
+        if x.strip()
+    }
+except ValueError as exc:
+    raise RuntimeError(
+        "ALLOWED_USER_IDS must contain numeric Telegram user IDs."
+    ) from exc
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO")
+)
+log = logging.getLogger("villan")
+
 app = Client(
     "bot_service",
     api_id=API_ID,
@@ -28,9 +56,8 @@ app = Client(
     workers=16,
 )
 
-user = None
-if SESSION_STRING and len(SESSION_STRING) > 30:
-    user = Client(
+user = (
+    Client(
         "user_service",
         api_id=API_ID,
         api_hash=API_HASH,
@@ -38,46 +65,97 @@ if SESSION_STRING and len(SESSION_STRING) > 30:
         in_memory=True,
         workers=16,
     )
+    if SESSION_STRING and len(SESSION_STRING) > 30
+    else None
+)
 
 SEMAPHORE = asyncio.Semaphore(2)
 USER_STATES = {}
+RUNNING_JOBS = {}
+
 USERBOT_ONLINE = False
+MAX_BATCH_ITEMS = 150
+MAX_FILE_SIZE = 2_000_000_000
+
+TEMP_ROOT = (
+    Path(tempfile.gettempdir())
+    / "villan_restriction_bot"
+)
 
 
-# --- KOYEB HEALTH CHECK WEB SERVER ---
+# ==================== SECURITY ====================
+
+def is_allowed(message):
+    return bool(
+        message.from_user
+        and message.from_user.id in ALLOWED_USER_IDS
+    )
+
+
+async def deny_if_not_allowed(message):
+    if is_allowed(message):
+        return False
+
+    try:
+        await message.reply_text(
+            "⛔ Aapko is bot ko use karne ki permission nahi hai."
+        )
+    except Exception:
+        pass
+
+    return True
+
+
+# ==================== KOYEB HEALTH CHECK ====================
+
 async def health_check(request):
-    return web.Response(text="⚡ VILLAN Restricted Bot is Active!")
+    return web.Response(
+        text="VILLAN Restricted Bot is Active!"
+    )
 
 
 async def start_web_server():
     server = web.Application()
     server.router.add_get("/", health_check)
+
     runner = web.AppRunner(server)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
+
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        PORT,
+    )
     await site.start()
-    print(f"Health check running on port {PORT}")
+
+    log.info("Health check running on port %s", PORT)
 
 
-# --- FORMATTING UTILITIES ---
+# ==================== FORMATTING ====================
+
 def humanbytes(size):
     if not size:
         return "0 B"
-    power = 2**10
-    n = 0
+
+    value = float(size)
     units = ["B", "KB", "MB", "GB", "TB"]
-    while size > power:
-        size /= power
-        n += 1
-    return f"{size:.2f} {units[n]}"
+    unit = 0
+
+    while value >= 1024 and unit < len(units) - 1:
+        value /= 1024
+        unit += 1
+
+    return f"{value:.2f} {units[unit]}"
 
 
-def time_formatter(milliseconds: int) -> str:
-    seconds, milliseconds = divmod(int(milliseconds), 1000)
+def time_formatter(milliseconds):
+    seconds = int(milliseconds / 1000)
     minutes, seconds = divmod(seconds, 60)
     hours, minutes = divmod(minutes, 60)
     days, hours = divmod(hours, 24)
+
     parts = []
+
     if days:
         parts.append(f"{days}d")
     if hours:
@@ -86,242 +164,577 @@ def time_formatter(milliseconds: int) -> str:
         parts.append(f"{minutes}m")
     if seconds:
         parts.append(f"{seconds}s")
+
     return ", ".join(parts) if parts else "0s"
 
 
 def get_progress_bar(percentage):
-    completed = int(percentage // 10)
-    remaining = 10 - completed
-    return "▰" * completed + "▱" * remaining
+    completed = max(
+        0,
+        min(10, int(percentage // 10)),
+    )
+    return "▰" * completed + "▱" * (10 - completed)
 
 
-# --- LIVE PROGRESS TRACKER ---
 async def progress_bar(
-    current, total, message, start_time, last_update, action_title
+    current,
+    total,
+    message,
+    start_time,
+    last_update,
+    action_title,
 ):
     now = time.time()
-    if (now - last_update[0]) < 5.0 and current != total:
+
+    if now - last_update[0] < 5 and current != total:
         return
+
     last_update[0] = now
+    elapsed = max(now - start_time, 0.001)
+    speed = current / elapsed
+    percentage = current * 100 / total if total else 0
+    left = max(total - current, 0)
 
-    elapsed_time = max(now - start_time, 0.001)
-    speed = current / elapsed_time
-    percentage = (current * 100 / total) if total > 0 else 0
-    bar = get_progress_bar(percentage)
+    eta = time_formatter(
+        (round(left / speed) if speed else 0) * 1000
+    )
 
-    remaining_bytes = max(total - current, 0)
-    time_left = round(remaining_bytes / speed) if speed > 0 else 0
-
-    eta = time_formatter(time_left * 1000)
-    elapsed = time_formatter(elapsed_time * 1000)
-
-    card_lines = [
+    lines = [
         "╭━━━━━━━━━━━━━━━━━━━━╮",
-        "┃ 🦅 **VILLAN CLONER** 🦅",
+        "┃ 🦅 **VILLAN ENGINE**",
         f"┃ ⚡ **{action_title}**",
         "┣━━━━━━━━━━━━━━━━━━━━┫",
-        f"┃ `[{bar}]` **{percentage:.1f}%**",
+        f"┃ `[{get_progress_bar(percentage)}]` "
+        f"**{percentage:.1f}%**",
         f"┃ ⚡ **Speed:** `{humanbytes(speed)}/s`",
-        f"┃ 💾 **Done:** `{humanbytes(current)} / {humanbytes(total)}`",
-        f"┃ 📦 **Left:** `{humanbytes(remaining_bytes)}`",
+        f"┃ 💾 **Done:** `{humanbytes(current)} / "
+        f"{humanbytes(total)}`",
+        f"┃ 📦 **Left:** `{humanbytes(left)}`",
         f"┃ ⏳ **ETA:** `{eta}`",
-        f"┃ ⏱️ **Elapsed:** `{elapsed}`",
+        f"┃ ⏱️ **Elapsed:** "
+        f"`{time_formatter(elapsed * 1000)}`",
         "╰━━━━━━━━━━━━━━━━━━━━╯",
     ]
+
     try:
-        await message.edit_text("\n".join(card_lines))
+        await message.edit_text("\n".join(lines))
+    except asyncio.CancelledError:
+        raise
     except Exception:
         pass
 
 
-def parse_tg_link(link: str):
-    regex = r"https://t\.me/(?:c/(\d+)|([a-zA-Z0-9_]+))/(?:(\d+)/)?(\d+)"
-    match = re.search(regex, link)
+# ==================== TELEGRAM LINKS ====================
+
+def parse_tg_link(link):
+    pattern = (
+        r"https?://t\.me/"
+        r"(?:c/(\d+)|([a-zA-Z0-9_]+)/)"
+        r"(?:(\d+)/)?(\d+)(?:-(\d+))?"
+    )
+
+    match = re.search(pattern, link.strip())
+
     if not match:
         return None, None
-    chat_id = int(f"-100{match.group(1)}") if match.group(1) else match.group(2)
-    message_id = int(match.group(4))
+
+    if match.group(1):
+        chat_id = int("-100" + match.group(1))
+    else:
+        chat_id = match.group(2)
+
+    message_id = int(match.group(5) or match.group(4))
+
     return chat_id, message_id
 
 
-# --- MESSAGE PROCESSING ENGINE ---
+async def safe_edit(message, text):
+    try:
+        await message.edit_text(text)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+
+
+# ==================== BATCH SUMMARY ====================
+
+def batch_summary(counts, total, cancelled=False):
+    processed = sum(counts.values())
+
+    title = (
+        "🛑 **Batch cancelled**"
+        if cancelled
+        else "✅ **Batch finished**"
+    )
+
+    return (
+        f"{title}\n\n"
+        f"📦 **Total:** `{total}`\n"
+        f"✅ **Successful:** `{counts['success']}`\n"
+        f"❌ **Failed:** `{counts['failed']}`\n"
+        f"⏭️ **Skipped:** `{counts['skipped']}`\n"
+        f"📊 **Processed:** `{processed}/{total}`"
+    )
+
+
+# ==================== PROCESS ONE MESSAGE ====================
+
 async def process_single_message(
-    client, user_client, target_chat, msg_id, status_msg, chat_id
+    client,
+    user_client,
+    target_chat,
+    msg_id,
+    status_msg,
+    chat_id,
 ):
     if not USERBOT_ONLINE or not user_client:
         await client.send_message(
             chat_id,
-            "❌ **Userbot session offline hai!** Koyeb environment me `SESSION_STRING` check karein.",
+            "❌ Userbot offline hai. "
+            "Koyeb mein SESSION_STRING check karein.",
         )
         return "BREAK"
 
-    file_path = None
-    thumb_path = None
+    temp_dir = None
+
     try:
-        target_msg = await user_client.get_messages(target_chat, msg_id)
-        if not target_msg or target_msg.empty:
-            return False
+        msg = await user_client.get_messages(
+            target_chat,
+            msg_id,
+        )
 
-        if not target_msg.media:
-            if target_msg.text:
-                await client.send_message(chat_id, target_msg.text)
-                return True
-            return False
+        if not msg or getattr(msg, "empty", False):
+            return "SKIPPED"
 
-        media_obj = getattr(target_msg, target_msg.media.value)
-        file_size = getattr(media_obj, "file_size", 0)
-        if file_size > 2097152000:
-            await client.send_message(
-                chat_id, f"⚠️ **Message {msg_id}:** File 2GB se badi hai."
+        # Protected media is skipped, not bypassed.
+        if getattr(msg, "has_protected_content", False):
+            log.info(
+                "Skipping protected message %s",
+                msg_id,
             )
-            return False
+            return "SKIPPED"
 
+        # Plain text messages
+        if not msg.media:
+            if msg.text:
+                await client.send_message(
+                    chat_id,
+                    msg.text,
+                )
+                return "SUCCESS"
+
+            return "SKIPPED"
+
+        media_type = getattr(msg.media, "value", "")
+        media_obj = getattr(msg, media_type, None)
+
+        if media_obj is None:
+            return "SKIPPED"
+
+        file_size = (
+            getattr(media_obj, "file_size", 0) or 0
+        )
+
+        if file_size > MAX_FILE_SIZE:
+            log.warning(
+                "Oversized file in message %s",
+                msg_id,
+            )
+            return "SKIPPED"
+
+        # Unique directory for each message
+        TEMP_ROOT.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        temp_dir = tempfile.mkdtemp(
+            prefix="item_",
+            dir=str(TEMP_ROOT),
+        )
+
+        download_dir = str(Path(temp_dir)) + os.sep
+
+        started = time.time()
         last_update = [time.time()]
-        start_time = time.time()
-        file_path = await user_client.download_media(
-            target_msg,
+
+        path = await user_client.download_media(
+            msg,
+            file_name=download_dir,
             progress=progress_bar,
             progress_args=(
                 status_msg,
-                start_time,
+                started,
                 last_update,
                 "📥 Downloading...",
             ),
         )
 
-        if target_msg.video and target_msg.video.thumbs:
-            try:
-                thumb_path = await user_client.download_media(
-                    target_msg.video.thumbs[0].file_id
-                )
-            except Exception:
-                thumb_path = None
+        if not path or not os.path.isfile(path):
+            return "FAILED"
 
-        caption = target_msg.caption or ""
+        caption = msg.caption or ""
+
+        started = time.time()
         last_update = [time.time()]
-        start_time = time.time()
 
-        if target_msg.video:
+        args = (
+            status_msg,
+            started,
+            last_update,
+            "🚀 Uploading...",
+        )
+
+        # Photo
+        if msg.photo:
+            await client.send_photo(
+                chat_id,
+                path,
+                caption=caption,
+            )
+
+        # Video
+        elif msg.video:
+            thumb = None
+
+            if msg.video.thumbs:
+                try:
+                    thumb = await user_client.download_media(
+                        msg.video.thumbs[0].file_id,
+                        file_name=download_dir,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.debug(
+                        "Thumbnail unavailable for %s",
+                        msg_id,
+                    )
+
             await client.send_video(
                 chat_id,
-                video=file_path,
+                path,
                 caption=caption,
-                thumb=thumb_path,
-                duration=target_msg.video.duration,
-                width=target_msg.video.width,
-                height=target_msg.video.height,
+                thumb=thumb,
+                duration=msg.video.duration,
+                width=msg.video.width,
+                height=msg.video.height,
                 progress=progress_bar,
-                progress_args=(
-                    status_msg,
-                    start_time,
-                    last_update,
-                    "🚀 Uploading Video...",
-                ),
+                progress_args=args,
             )
-        elif target_msg.document:
+
+        # Documents and files
+        elif msg.document:
             await client.send_document(
                 chat_id,
-                document=file_path,
+                path,
                 caption=caption,
-                thumb=thumb_path,
                 progress=progress_bar,
-                progress_args=(
-                    status_msg,
-                    start_time,
-                    last_update,
-                    "🚀 Uploading Document...",
-                ),
+                progress_args=args,
             )
-        elif target_msg.audio:
+
+        # Music/audio
+        elif msg.audio:
             await client.send_audio(
                 chat_id,
-                audio=file_path,
+                path,
                 caption=caption,
-                duration=target_msg.audio.duration,
-                performer=target_msg.audio.performer,
-                title=target_msg.audio.title,
+                duration=msg.audio.duration,
+                performer=msg.audio.performer,
+                title=msg.audio.title,
                 progress=progress_bar,
-                progress_args=(
-                    status_msg,
-                    start_time,
-                    last_update,
-                    "🚀 Uploading Audio...",
-                ),
+                progress_args=args,
             )
-        elif target_msg.photo:
-            await client.send_photo(chat_id, photo=file_path, caption=caption)
 
-        return True
+        # GIF/animation
+        elif msg.animation:
+            await client.send_animation(
+                chat_id,
+                path,
+                caption=caption,
+                progress=progress_bar,
+                progress_args=args,
+            )
 
-    except (ChannelPrivate, ChatAdminRequired, UserNotParticipant):
-        await client.send_message(
-            chat_id,
-            "❌ **Error:** Userbot account is private channel ka member nahi hai.",
+        # Voice notes
+        elif msg.voice:
+            await client.send_voice(
+                chat_id,
+                path,
+                caption=caption,
+                duration=msg.voice.duration,
+                progress=progress_bar,
+                progress_args=args,
+            )
+
+        # Round video notes
+        elif msg.video_note:
+            await client.send_video_note(
+                chat_id,
+                path,
+                duration=msg.video_note.duration,
+                length=msg.video_note.length,
+                progress=progress_bar,
+                progress_args=args,
+            )
+
+        # Stickers
+        elif msg.sticker:
+            await client.send_sticker(
+                chat_id,
+                path,
+            )
+
+        # Unsupported media type
+        else:
+            return "SKIPPED"
+
+        return "SUCCESS"
+
+    except asyncio.CancelledError:
+        raise
+
+    except (
+        ChannelPrivate,
+        ChatAdminRequired,
+        UserNotParticipant,
+    ):
+        log.warning(
+            "Source access denied for message %s",
+            msg_id,
         )
         return "BREAK"
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
-        return False
-    except Exception as e:
-        print(f"Error on {msg_id}: {e}")
-        return False
+
+    except FloodWait as exc:
+        await asyncio.sleep(exc.value)
+        return "FAILED"
+
+    except Exception:
+        log.exception(
+            "Failed processing message %s",
+            msg_id,
+        )
+        return "FAILED"
+
     finally:
-        for p in [file_path, thumb_path]:
-            if p and os.path.exists(p):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
+        if temp_dir:
+            shutil.rmtree(
+                temp_dir,
+                ignore_errors=True,
+            )
 
 
-# --- VILLAN START COMMAND ---
-@app.on_message(filters.command("start") & filters.private)
+# ==================== BATCH WORKER ====================
+
+async def run_batch(
+    client,
+    user_id,
+    target_chat,
+    start_id,
+    end_id,
+    status_msg,
+):
+    total = end_id - start_id + 1
+
+    counts = {
+        "success": 0,
+        "failed": 0,
+        "skipped": 0,
+    }
+
+    cancelled = False
+
+    try:
+        async with SEMAPHORE:
+            for idx, msg_id in enumerate(
+                range(start_id, end_id + 1),
+                1,
+            ):
+                await safe_edit(
+                    status_msg,
+                    f"🔄 **Processing `{idx}/{total}`**\n"
+                    f"🎯 Message ID: `{msg_id}`\n"
+                    f"✅ `{counts['success']}`  "
+                    f"❌ `{counts['failed']}`  "
+                    f"⏭️ `{counts['skipped']}`",
+                )
+
+                result = await process_single_message(
+                    client,
+                    user,
+                    target_chat,
+                    msg_id,
+                    status_msg,
+                    user_id,
+                )
+
+                if result == "BREAK":
+                    counts["failed"] += 1
+                    counts["skipped"] += total - idx
+                    break
+
+                counts[result.lower()] += 1
+
+                if idx < total:
+                    await asyncio.sleep(1.5)
+
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
+
+    finally:
+        task = asyncio.current_task()
+
+        if RUNNING_JOBS.get(user_id) is task:
+            RUNNING_JOBS.pop(user_id, None)
+
+        if cancelled:
+            remaining = total - sum(counts.values())
+            counts["skipped"] += max(0, remaining)
+
+        await safe_edit(
+            status_msg,
+            batch_summary(
+                counts,
+                total,
+                cancelled,
+            ),
+        )
+
+
+# ==================== COMMANDS ====================
+
+@app.on_message(
+    filters.command("start") & filters.private
+)
 async def start_handler(client, message):
-    print(f"📩 /start command received from: {message.chat.id}")
-    user_status = "🟢 Connected" if USERBOT_ONLINE else "🔴 Disconnected"
+    if await deny_if_not_allowed(message):
+        return
 
-    start_lines = [
-        "╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮",
-        "┃ 🦅 **ᴹᴿ ᴠɪʟʟᴀɪɴ RESTRICTION BOT** 🦅",
-        "┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫",
-        "┃ ⚡ **Welcome!**",
-        "┃ ",
-        "┃ Main private channels se restricted",
-        "┃ content (Video, PDF, Audio, Photo)",
-        "┃ instantly save karne ke liye ready hoon.",
-        "┃ ",
-        f"┃ ⚙️ **Engine Status:** `{user_status}`",
-        "┃ ",
-        "┃ 📌 **Commands:**",
-        "┃ • `/batch`  - Step-by-step range extraction",
-        "┃ • `/cancel` - Active queue stop karne ke liye",
-        "┃ • Direct channel post link paste karein",
-        "┃ ",
-        "┃ ⚡ *Ultra-Fast MTProto Engine by VILLAN*",
-        "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯",
-    ]
-    await message.reply_text("\n".join(start_lines))
-
-
-@app.on_message(filters.command("cancel") & filters.private)
-async def cancel_handler(client, message):
-    if message.chat.id in USER_STATES:
-        del USER_STATES[message.chat.id]
-        await message.reply_text("🛑 **VILLAN Engine:** Task cancel kar diya gaya hai.")
-    else:
-        await message.reply_text("Kuch bhi active nahi hai cancel karne ke liye.")
-
-
-@app.on_message(filters.command("batch") & filters.private)
-async def batch_start_handler(client, message):
-    print(f"📩 /batch command received from: {message.chat.id}")
-    USER_STATES[message.chat.id] = {"step": "WAITING_FIRST_LINK"}
-    await message.reply_text(
-        "🔗 **VILLAN Batch System - Step 1/2**\n\n"
-        "Kripya **start message ka link** bhejiye jahan se files extract shuru karni hain.\n\n"
-        "*(Cancel karne ke liye `/cancel` likhein)*"
+    status = (
+        "🟢 Connected"
+        if USERBOT_ONLINE
+        else "🔴 Disconnected"
     )
 
+    await message.reply_text(
+        "╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮\n"
+        "┃ 🦅 **VILLAN RESTRICTION BOT**\n"
+        "┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n"
+        "┃ Private bot ready hai.\n"
+        f"┃ ⚙️ **Userbot:** `{status}`\n"
+        "┃ 📌 **Commands:**\n"
+        "┃ • `/batch` - Start/end link range\n"
+        "┃ • `/cancel` - Stop running batch\n"
+        "┃ • Single post/range link bhejein\n"
+        "┃ 🔒 Protected posts skip honge.\n"
+        "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
+    )
+
+
+@app.on_message(
+    filters.command("cancel") & filters.private
+)
+async def cancel_handler(client, message):
+    if await deny_if_not_allowed(message):
+        return
+
+    uid = message.from_user.id
+    task = RUNNING_JOBS.get(uid)
+
+    if task and not task.done():
+        task.cancel()
+
+        await message.reply_text(
+            "🛑 Cancellation request bhej di. "
+            "Final counts status message par aayenge."
+        )
+
+    elif uid in USER_STATES:
+        USER_STATES.pop(uid, None)
+
+        await message.reply_text(
+            "🛑 Batch setup cancel kar diya."
+        )
+
+    else:
+        await message.reply_text(
+            "Koi active batch nahi hai."
+        )
+
+
+@app.on_message(
+    filters.command("batch") & filters.private
+)
+async def batch_start_handler(client, message):
+    if await deny_if_not_allowed(message):
+        return
+
+    uid = message.from_user.id
+
+    if (
+        uid in RUNNING_JOBS
+        and not RUNNING_JOBS[uid].done()
+    ):
+        await message.reply_text(
+            "⚠️ Ek batch already chal raha hai. "
+            "Pehle /cancel karein."
+        )
+        return
+
+    USER_STATES[uid] = {
+        "step": "WAITING_FIRST_LINK"
+    }
+
+    await message.reply_text(
+        "🔗 **Batch Step 1/2**\n"
+        "Start message ka Telegram link bhejein.\n"
+        "`/cancel` se cancel karein."
+    )
+
+
+# ==================== START BATCH ====================
+
+async def launch_batch(
+    client,
+    message,
+    uid,
+    chat_id,
+    start_id,
+    end_id,
+):
+    old = RUNNING_JOBS.get(uid)
+
+    if old and not old.done():
+        await message.reply_text(
+            "⚠️ Ek batch already chal raha hai. "
+            "Pehle /cancel karein."
+        )
+        return
+
+    status = await message.reply_text(
+        f"🦅 **VILLAN Batch Started**\n"
+        f"Range: `{start_id}-{end_id}`\n"
+        f"Total: `{end_id - start_id + 1}`"
+    )
+
+    task = asyncio.create_task(
+        run_batch(
+            client,
+            uid,
+            chat_id,
+            start_id,
+            end_id,
+            status,
+        ),
+        name=f"villan-batch-{uid}",
+    )
+
+    RUNNING_JOBS[uid] = task
+
+
+# ==================== LINK HANDLER ====================
 
 @app.on_message(
     filters.text
@@ -329,158 +742,190 @@ async def batch_start_handler(client, message):
     & ~filters.command(["start", "batch", "cancel"])
 )
 async def message_dispatcher(client, message):
-    user_id = message.chat.id
-    text = message.text.strip()
-    print(f"📩 Text received from {user_id}: {text[:30]}...")
+    if await deny_if_not_allowed(message):
+        return
 
-    if (
-        user_id in USER_STATES
-        and USER_STATES[user_id].get("step") == "WAITING_FIRST_LINK"
-    ):
-        chat_id, start_id = parse_tg_link(text)
-        if not chat_id or not start_id:
+    uid = message.from_user.id
+    value = message.text.strip()
+
+    state = USER_STATES.get(uid)
+
+    if state and state.get("step") == "WAITING_FIRST_LINK":
+        chat, first = parse_tg_link(value)
+
+        if not chat or not first:
             await message.reply_text(
-                "❌ **Invalid link!** Sahi Telegram channel post link bhejiye."
+                "❌ Invalid Telegram post link. Dobara try karein."
             )
             return
 
-        USER_STATES[user_id] = {
+        USER_STATES[uid] = {
             "step": "WAITING_LAST_LINK",
-            "chat_id": chat_id,
-            "start_id": start_id,
+            "chat_id": chat,
+            "start_id": first,
         }
+
         await message.reply_text(
-            f"✅ **Start Message Locked:** (ID: `{start_id}`)\n\n"
-            "🔗 **VILLAN Batch System - Step 2/2**\n\n"
-            "Ab **aakhiri (last) message ka link** send karein."
+            f"✅ Start message locked: `{first}`\n"
+            "Ab last message ka link bhejein."
         )
         return
 
-    elif (
-        user_id in USER_STATES
-        and USER_STATES[user_id].get("step") == "WAITING_LAST_LINK"
-    ):
-        chat_id, end_id = parse_tg_link(text)
-        if not chat_id or not end_id:
+    if state and state.get("step") == "WAITING_LAST_LINK":
+        chat, last = parse_tg_link(value)
+
+        if not chat or not last:
             await message.reply_text(
-                "❌ **Invalid link!** Sahi Telegram channel post link bhejiye."
+                "❌ Invalid Telegram post link. Dobara try karein."
             )
             return
 
-        state = USER_STATES.pop(user_id)
-        if state["chat_id"] != chat_id:
+        USER_STATES.pop(uid, None)
+
+        if state["chat_id"] != chat:
             await message.reply_text(
-                "❌ **Mismatched Channels!** Start aur End links ek hi channel ke hone chahiye."
+                "❌ Start aur end links ek hi channel ke hone chahiye."
             )
             return
 
-        start_id = state["start_id"]
-        if start_id > end_id:
-            start_id, end_id = end_id, start_id
+        first = state["start_id"]
+        first, last = min(first, last), max(first, last)
 
-        total_files = end_id - start_id + 1
-        if total_files > 150:
+        if last - first + 1 > MAX_BATCH_ITEMS:
             await message.reply_text(
-                "⚠️ Safety ke liye ek baar mein max 150 posts allow hain."
+                f"⚠️ Ek batch mein max {MAX_BATCH_ITEMS} posts allowed hain."
             )
             return
 
-        status_msg = await message.reply_text(
-            f"🦅 **VILLAN Extraction Engine Started!**\n\n"
-            f"📊 **Range:** `{start_id}` se `{end_id}`\n"
-            f"📦 **Total Items:** `{total_files}`"
+        await launch_batch(
+            client, message, uid, chat, first, last
         )
-
-        async with SEMAPHORE:
-            for idx, current_id in enumerate(range(start_id, end_id + 1), start=1):
-                await status_msg.edit_text(
-                    f"🔄 **Processing Item `{idx}/{total_files}`**\n"
-                    f"🎯 Message ID: `{current_id}`\n"
-                    f"⏳ Queue fetching..."
-                )
-                res = await process_single_message(
-                    client, user, chat_id, current_id, status_msg, user_id
-                )
-                if res == "BREAK":
-                    break
-                await asyncio.sleep(2)
-
-        await status_msg.edit_text("✅ **VILLAN Engine:** Batch extraction complete!")
         return
 
-    range_regex = (
-        r"https://t\.me/(?:c/(\d+)|([a-zA-Z0-9_]+))/(?:(\d+)/)?(\d+)(?:-(\d+))?"
+    pattern = (
+        r"https?://t\.me/"
+        r"(?:c/(\d+)|([a-zA-Z0-9_]+)/)"
+        r"(?:(\d+)/)?(\d+)(?:-(\d+))?"
     )
-    match = re.search(range_regex, text)
-    if match:
-        chat_id = int(f"-100{match.group(1)}") if match.group(1) else match.group(2)
-        start_id = int(match.group(4))
-        end_id = int(match.group(5)) if match.group(5) else start_id
 
-        if start_id > end_id:
-            start_id, end_id = end_id, start_id
+    match = re.search(pattern, value)
 
-        total = end_id - start_id + 1
-        if total > 150:
-            await message.reply_text("⚠️ Max 150 messages allow hain ek baar mein.")
-            return
+    if not match:
+        return
 
-        status_msg = await message.reply_text(
-            f"⏳ **VILLAN Engine:** `{total}` item(s) queue mein hain..."
+    chat = (
+        int("-100" + match.group(1))
+        if match.group(1)
+        else match.group(2)
+    )
+
+    first = int(match.group(4))
+    last = int(match.group(5) or match.group(4))
+    first, last = min(first, last), max(first, last)
+
+    if last - first + 1 > MAX_BATCH_ITEMS:
+        await message.reply_text(
+            f"⚠️ Ek batch mein max {MAX_BATCH_ITEMS} posts allowed hain."
         )
+        return
 
-        async with SEMAPHORE:
-            for idx, current_id in enumerate(range(start_id, end_id + 1), start=1):
-                if total > 1:
-                    await status_msg.edit_text(
-                        f"🔄 **Processing Item `{idx}/{total}`** (ID: `{current_id}`)..."
-                    )
-                res = await process_single_message(
-                    client, user, chat_id, current_id, status_msg, user_id
-                )
-                if res == "BREAK":
-                    break
-                if total > 1:
-                    await asyncio.sleep(2)
-
-        await status_msg.delete()
+    await launch_batch(
+        client, message, uid, chat, first, last
+    )
 
 
-# --- BACKGROUND USERBOT CONNECT ---
+# ==================== USERBOT CONNECTION ====================
+
 async def start_userbot_background():
     global USERBOT_ONLINE
+
     if not user:
-        print("⚠️ SESSION_STRING provide nahi kiya gaya ya 30 chars se chhota hai.")
+        log.warning(
+            "SESSION_STRING missing or too short; userbot disabled."
+        )
         return
-    print("Connecting Userbot Session in background...")
+
     try:
         await user.start()
         USERBOT_ONLINE = True
-        print("Userbot Client Connected Successfully! ✅")
-    except Exception as e:
+        log.info("Userbot connected.")
+
+    except Exception:
         USERBOT_ONLINE = False
-        print(f"❌ Userbot connection failed: {e}")
+        log.exception("Userbot connection failed")
 
 
-# --- MAIN ASYNC ENGINE ---
+# ==================== MAIN ====================
+
 async def main():
+    # Old temporary files are removed at startup.
+    shutil.rmtree(
+        TEMP_ROOT,
+        ignore_errors=True,
+    )
+    TEMP_ROOT.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
     await start_web_server()
 
-    print("Starting Bot Client...")
     await app.start()
-    bot_info = await app.get_me()
-    print(f"Bot Online as @{bot_info.username}! ✅")
+    me = await app.get_me()
 
-    # Userbot background me start hoga taaki main bot client kabhi freeze na ho
-    asyncio.create_task(start_userbot_background())
+    log.info(
+        "Bot online as @%s",
+        me.username,
+    )
 
-    print("🦅 VILLAN Restricted Bot is Fully LIVE and listening!")
-    await idle()
-    await app.stop()
-    if user and USERBOT_ONLINE:
-        await user.stop()
+    user_task = asyncio.create_task(
+        start_userbot_background()
+    )
+
+    try:
+        await idle()
+
+    finally:
+        jobs = list(RUNNING_JOBS.values())
+
+        for task in jobs:
+            if not task.done():
+                task.cancel()
+
+        if jobs:
+            await asyncio.gather(
+                *jobs,
+                return_exceptions=True,
+            )
+
+        user_task.cancel()
+
+        await asyncio.gather(
+            user_task,
+            return_exceptions=True,
+        )
+
+        if user and USERBOT_ONLINE:
+            await user.stop()
+
+        await app.stop()
+
+        shutil.rmtree(
+            TEMP_ROOT,
+            ignore_errors=True,
+        )
 
 
 if __name__ == "__main__":
+    if not API_ID or not API_HASH or not BOT_TOKEN:
+        raise RuntimeError(
+            "Set API_ID, API_HASH and BOT_TOKEN in Koyeb environment variables."
+        )
+
+    if not ALLOWED_USER_IDS:
+        log.warning(
+            "No ALLOWED_USER_IDS / OWNER_ID set: "
+            "all users will be denied."
+        )
+
     asyncio.run(main())
-    
