@@ -18,7 +18,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 SESSION_STRING = os.environ.get("SESSION_STRING", "").strip()
 PORT = int(os.environ.get("PORT", 8080))
 
-# Pyrogram Clients Setup (in_memory=True taaki Docker session lock na ho)
+# Pyrogram Clients Setup
 app = Client(
     "bot_service",
     api_id=API_ID,
@@ -39,10 +39,7 @@ if SESSION_STRING and len(SESSION_STRING) > 30:
         workers=16,
     )
 
-# Concurrency lock
 SEMAPHORE = asyncio.Semaphore(2)
-
-# Multi-step batch state storage
 USER_STATES = {}
 USERBOT_ONLINE = False
 
@@ -462,11 +459,14 @@ async def main():
     print("Bot Client Online! ✅")
 
     if user:
-        print("Connecting Userbot Session...")
+        print("Connecting Userbot Session (with 10s timeout shield)...")
         try:
-            await user.start()
+            await asyncio.wait_for(user.start(), timeout=10.0)
             USERBOT_ONLINE = True
             print("Userbot Client Connected Successfully! ✅")
+        except asyncio.TimeoutError:
+            USERBOT_ONLINE = False
+            print("❌ Userbot timeout: Session string interactive login (OTP/Phone) par ruk gayi.")
         except Exception as e:
             USERBOT_ONLINE = False
             print(f"❌ Userbot connection failed: {e}")
