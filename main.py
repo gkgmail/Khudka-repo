@@ -19,6 +19,7 @@ from pyrogram.errors import (
     PhoneCodeExpired,
     SessionPasswordNeeded,
     PasswordHashInvalid,
+    PeerIdInvalid,
 )
 
 # Pyrogram ka Client module-level par event loop capture kar leta hai,
@@ -254,9 +255,20 @@ async def safe_edit(msg, text):
         pass
 
 
-# --- LIVE PROGRESS TRACKER ---
+# --- BATCH STATS (poore batch ka live hisaab) ---
+class BatchStats:
+    def __init__(self, total):
+        self.total = total
+        self.done = 0
+        self.ok = 0
+        self.fail = 0
+        self.start = time.time()
+        self.lock = asyncio.Lock()
+
+
+# --- LIVE PROGRESS TRACKER (file + batch dashboard) ---
 async def progress_bar(
-    current, total, message, start_time, last_update, action_title
+    current, total, message, start_time, last_update, action_title, stats=None
 ):
     now = time.time()
     if (now - last_update[0]) < PROGRESS_EVERY and current != total:
@@ -271,20 +283,33 @@ async def progress_bar(
     remaining_bytes = max(total - current, 0)
     time_left = round(remaining_bytes / speed) if speed > 0 else 0
 
-    card_lines = [
+    lines = [
         "╭━━━━━━━━━━━━━━━━━━━━╮",
         "┃ 🦅 **VILLAN CLONER** 🦅",
+    ]
+    if stats is not None:
+        async with stats.lock:
+            done, ok, fail, total_b, bstart = (
+                stats.done, stats.ok, stats.fail, stats.total, stats.start,
+            )
+        b_pct = (done * 100 / total_b) if total_b else 0
+        avg = max(now - bstart, 0.001) / max(done, 1)
+        eta_b = avg * max(total_b - done, 0)
+        lines += [
+            f"┃ 📦 **Batch:** `{done}/{total_b}` (`{b_pct:.0f}%`)",
+            f"┃ ✅ `{ok}` ok • ❌ `{fail}` fail",
+            f"┃ ⏳ **Batch ETA:** `~{time_formatter(eta_b * 1000)}`",
+            "┣━━━━━━━━━━━━━━━━━━━━┫",
+        ]
+    lines += [
         f"┃ ⚡ **{action_title}**",
-        "┣━━━━━━━━━━━━━━━━━━━━┫",
         f"┃ `[{bar}]` **{percentage:.1f}%**",
-        f"┃ ⚡ **Speed:** `{humanbytes(speed)}/s`",
-        f"┃ 💾 **Done:** `{humanbytes(current)} / {humanbytes(total)}`",
-        f"┃ 📦 **Left:** `{humanbytes(remaining_bytes)}`",
-        f"┃ ⏳ **ETA:** `{time_formatter(time_left * 1000)}`",
-        f"┃ ⏱️ **Elapsed:** `{time_formatter(elapsed_time * 1000)}`",
+        f"┃ 🚀 **Speed:** `{humanbytes(speed)}/s`",
+        f"┃ 💾 **Downloaded:** `{humanbytes(current)} / {humanbytes(total)}`",
+        f"┃ ⏳ **File ETA:** `{time_formatter(time_left * 1000)}`",
         "╰━━━━━━━━━━━━━━━━━━━━╯",
     ]
-    await safe_edit(message, "\n".join(card_lines))
+    await safe_edit(message, "\n".join(lines))
 
 
 def parse_tg_link(link: str):
@@ -298,15 +323,28 @@ def parse_tg_link(link: str):
 
 
 # --- PHASE 1: DOWNLOAD (parallel, tez) ---
-async def download_one(user_client, src_chat, msg_id, status_msg):
+async def _fetch_with_warmup(user_client, src_chat, msg_id):
+    """get_messages karo. 'Peer id invalid' aaye to dialogs sync karke
+    peer cache warm karo aur ek baar retry karo (fresh login me hota hai)."""
+    try:
+        return await user_client.get_messages(src_chat, msg_id)
+    except PeerIdInvalid:
+        try:
+            await user_client.get_dialogs(limit=500)
+        except Exception as e:
+            print(f"dialog warmup failed: {e}", flush=True)
+        return await user_client.get_messages(src_chat, msg_id)
+
+
+async def download_one(user_client, src_chat, msg_id, status_msg, stats=None):
     """Ek message userbot se download karo.
-    Returns: info dict | None (skip) | 'BREAK' (fatal) | 'OFFLINE'."""
+    Returns: info dict | None (skip) | 'BREAK' (fatal) | 'OFFLINE' | 'PEER_INVALID'."""
     if not user_client:
         return "OFFLINE"
 
     tmpdir = tempfile.mkdtemp(prefix=f"vln_{msg_id}_")
     try:
-        target_msg = await user_client.get_messages(src_chat, msg_id)
+        target_msg = await _fetch_with_warmup(user_client, src_chat, msg_id)
         if not target_msg or target_msg.empty:
             return None
 
@@ -333,7 +371,8 @@ async def download_one(user_client, src_chat, msg_id, status_msg):
             file_name=dl_path,
             progress=progress_bar,
             progress_args=(
-                status_msg, start_time, last_update, "📥 Downloading...",
+                status_msg, start_time, last_update,
+                f"📥 Downloading • ID `{msg_id}`", stats,
             ),
         )
         if not file_path or not os.path.exists(file_path):
@@ -373,6 +412,9 @@ async def download_one(user_client, src_chat, msg_id, status_msg):
             info.update({"duration": target_msg.voice.duration})
         return info
 
+    except PeerIdInvalid:
+        # Retry ke baad bhi peer nahi mila = account channel ka member nahi
+        return "PEER_INVALID"
     except (ChannelPrivate, ChatAdminRequired, UserNotParticipant):
         return "BREAK"
     except FloodWait as e:
@@ -384,7 +426,7 @@ async def download_one(user_client, src_chat, msg_id, status_msg):
 
 
 # --- PHASE 2: UPLOAD (hamesha ORDER me, ek-ek karke) ---
-async def upload_one(client, dest_chat, status_msg, info):
+async def upload_one(client, dest_chat, status_msg, info, stats=None):
     kind = info["kind"]
     try:
         if kind == "text":
@@ -401,6 +443,7 @@ async def upload_one(client, dest_chat, status_msg, info):
         last_update = [time.time()]
         start_time = time.time()
         pa = (status_msg, start_time, last_update)
+        title = f"🚀 Uploading • ID `{info.get('msg_id')}`"
 
         if kind == "video":
             await client.send_video(
@@ -408,13 +451,13 @@ async def upload_one(client, dest_chat, status_msg, info):
                 duration=info.get("duration"),
                 width=info.get("width"), height=info.get("height"),
                 progress=progress_bar,
-                progress_args=pa + ("🚀 Uploading Video...",),
+                progress_args=pa + (title, stats),
             )
         elif kind == "document":
             await client.send_document(
                 dest_chat, document=fp, caption=cap, thumb=th,
                 progress=progress_bar,
-                progress_args=pa + ("🚀 Uploading Document...",),
+                progress_args=pa + (title, stats),
             )
         elif kind == "audio":
             await client.send_audio(
@@ -422,7 +465,7 @@ async def upload_one(client, dest_chat, status_msg, info):
                 duration=info.get("duration"),
                 performer=info.get("performer"), title=info.get("title"),
                 progress=progress_bar,
-                progress_args=pa + ("🚀 Uploading Audio...",),
+                progress_args=pa + (title, stats),
             )
         elif kind == "photo":
             await client.send_photo(dest_chat, photo=fp, caption=cap)
@@ -463,8 +506,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
     total = len(ids)
     cancel_event = asyncio.Event()
     ACTIVE_BATCHES[owner_id] = cancel_event
-    ok = 0
-    fail = 0
+    stats = BatchStats(total)
     # Ek window me itni files: download parallel, phir order me upload,
     # taaki disk par zyada load na pade aur sequence bhi na bigde
     WINDOW = PARALLEL_TASKS * 2
@@ -473,7 +515,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
         async with SEMAPHORE:
             if cancel_event.is_set():
                 return None
-            return await download_one(userbot, src_chat, mid, status_msg)
+            return await download_one(userbot, src_chat, mid, status_msg, stats)
 
     try:
         for w in range(0, total, WINDOW):
@@ -482,8 +524,8 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
             chunk = ids[w:w + WINDOW]
             await safe_edit(
                 status_msg,
-                f"📥 **Downloading** `{w + 1}`-`{w + len(chunk)}` / `{total}` "
-                f"(`{PARALLEL_TASKS}x` parallel)...\n⏹ Cancel: `/cancel`",
+                f"📦 **Batch:** `{w + 1}`-`{w + len(chunk)}` / `{total}` start ho raha hai...\n"
+                f"(`{PARALLEL_TASKS}x` parallel, order me delivery)\n⏹ Cancel: `/cancel`",
             )
             # gather result hamesha input ke ORDER me deta hai
             infos = await asyncio.gather(*(dl(mid) for mid in chunk))
@@ -491,6 +533,18 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
             # Upload hamesha original order me, ek-ek karke
             for info in infos:
                 if cancel_event.is_set():
+                    break
+                if info == "PEER_INVALID":
+                    await client.send_message(
+                        owner_id,
+                        "❌ **Channel/group nahi mila.**\n"
+                        "Tumhara logged-in account is channel ka **member nahi hai**, "
+                        "ya link galat hai.\n"
+                        "• Usi account se channel **join** karo jisse `/login` kiya tha\n"
+                        "• Link bilkul usi channel ka hona chahiye\n"
+                        "Phir dobara try karo.",
+                    )
+                    cancel_event.set()
                     break
                 if info == "BREAK":
                     await client.send_message(
@@ -500,21 +554,23 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
                     cancel_event.set()
                     break
                 if info == "OFFLINE" or info is None:
-                    fail += 1
+                    async with stats.lock:
+                        stats.done += 1
+                        stats.fail += 1
                     continue
-                done = ok + fail + 1
-                await safe_edit(
-                    status_msg,
-                    f"🚀 **Uploading** `{done}/{total}` (ID: `{info.get('msg_id')}`)...",
-                )
-                if await upload_one(client, owner_id, status_msg, info):
-                    ok += 1
-                else:
-                    fail += 1
+                ok_one = await upload_one(client, owner_id, status_msg, info, stats)
+                async with stats.lock:
+                    stats.done += 1
+                    if ok_one:
+                        stats.ok += 1
+                    else:
+                        stats.fail += 1
     finally:
         ACTIVE_BATCHES.pop(owner_id, None)
 
-    if cancel_event.is_set() and (ok + fail < total):
+    async with stats.lock:
+        ok, fail, done = stats.ok, stats.fail, stats.done
+    if cancel_event.is_set() and (done < total):
         await safe_edit(status_msg, "🛑 **Batch stopped.**")
     else:
         await safe_edit(
