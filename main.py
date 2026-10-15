@@ -8,6 +8,7 @@ import asyncio
 import tempfile
 from aiohttp import web
 from pyrogram import Client, filters, idle, enums
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import (
     FloodWait,
     ChannelPrivate,
@@ -42,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v11"
+VERSION = "v12"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -444,8 +445,9 @@ async def download_one(user_client, src_chat, msg_id, status_msg, stats=None):
 
 
 # --- PHASE 2: UPLOAD (hamesha ORDER me, ek-ek karke) ---
-async def upload_one(client, dest_chat, status_msg, info, stats=None):
+async def upload_one(client, uid, dest_chat, status_msg, info, stats=None):
     kind = info["kind"]
+    s = get_settings(uid)
     try:
         if kind == "text":
             await client.send_message(dest_chat, info["text"])
@@ -457,13 +459,51 @@ async def upload_one(client, dest_chat, status_msg, info, stats=None):
             )
             return False
 
-        fp, cap, th = info["file_path"], info["caption"], info.get("thumb_path")
+        # --- settings: filename (remove/replace/tag) ---
+        fp = info["file_path"]
+        base = os.path.basename(fp)
+        new_base = apply_filename_rules(base, s)
+        if new_base != base:
+            new_fp = os.path.join(os.path.dirname(fp), new_base)
+            try:
+                os.rename(fp, new_fp)
+                fp = new_fp
+                info["file_path"] = fp
+            except Exception:
+                pass
+
+        # --- settings: caption ---
+        cap = info["caption"] or ""
+        if s["caption"]:
+            try:
+                cap = s["caption"].format(filename=new_base)
+            except Exception:
+                cap = s["caption"]
+
+        # --- settings: custom thumbnail ---
+        th = info.get("thumb_path")
+        if s["thumb_file_id"]:
+            th = s["thumb_file_id"]
+
+        # --- settings: watermarks ---
+        if kind == "document" and new_base.lower().endswith(".pdf") and s["pdf_wm"]:
+            fp = apply_pdf_watermark(fp, s["pdf_wm"], info["tmpdir"])
+            info["file_path"] = fp
+        if kind == "video" and s["video_wm"]:
+            fp = apply_video_watermark(fp, s["video_wm"], info["tmpdir"])
+            info["file_path"] = fp
+
+        # --- settings: upload method ---
+        send_kind = kind
+        if kind == "video" and s["upload_as_doc"]:
+            send_kind = "document"
+
         last_update = [time.time()]
         start_time = time.time()
         pa = (status_msg, start_time, last_update)
         title = f"🚀 Uploading • ID `{info.get('msg_id')}`"
 
-        if kind == "video":
+        if send_kind == "video":
             await client.send_video(
                 dest_chat, video=fp, caption=cap, thumb=th,
                 duration=info.get("duration"),
@@ -471,13 +511,13 @@ async def upload_one(client, dest_chat, status_msg, info, stats=None):
                 progress=progress_bar,
                 progress_args=pa + (title, stats),
             )
-        elif kind == "document":
+        elif send_kind == "document":
             await client.send_document(
                 dest_chat, document=fp, caption=cap, thumb=th,
                 progress=progress_bar,
                 progress_args=pa + (title, stats),
             )
-        elif kind == "audio":
+        elif send_kind == "audio":
             await client.send_audio(
                 dest_chat, audio=fp, caption=cap,
                 duration=info.get("duration"),
@@ -485,14 +525,14 @@ async def upload_one(client, dest_chat, status_msg, info, stats=None):
                 progress=progress_bar,
                 progress_args=pa + (title, stats),
             )
-        elif kind == "photo":
+        elif send_kind == "photo":
             await client.send_photo(dest_chat, photo=fp, caption=cap)
-        elif kind == "voice":
+        elif send_kind == "voice":
             await client.send_voice(
                 dest_chat, voice=fp, caption=cap,
                 duration=info.get("duration"),
             )
-        elif kind == "video_note":
+        elif send_kind == "video_note":
             await client.send_video_note(dest_chat, video_note=fp)
         else:
             await client.send_document(dest_chat, document=fp, caption=cap)
@@ -528,6 +568,8 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
     cancel_event = asyncio.Event()
     ACTIVE_BATCHES[owner_id] = cancel_event
     stats = BatchStats(total)
+    # Settings: agar user ne chat ID set kiya hai to files wahi jayengi
+    dest_chat = get_settings(owner_id)["chat_id"] or owner_id
     peer_msg = (
         "❌ **Channel/group nahi mila.**\n"
         "Tumhara logged-in account is channel ka **member nahi hai**, "
@@ -573,7 +615,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
                     stats.fail += 1
                 continue
             # STEP 2: turant upload karo, phir agli file
-            ok_one = await upload_one(client, owner_id, status_msg, info, stats)
+            ok_one = await upload_one(client, owner_id, dest_chat, status_msg, info, stats)
             async with stats.lock:
                 stats.done += 1
                 if ok_one:
@@ -622,6 +664,7 @@ async def start_handler(client, message):
         "┃ • `/logout` - Logout",
         "┃ • `/plan`   - Apna plan dekho",
         "┃ • `/batch`  - Range extraction",
+        "┃ • `/settings` - Customize panel",
         "┃ • `/cancel` - Active queue stop",
         "┃ • Direct link paste karein",
     ]
@@ -656,6 +699,9 @@ async def cancel_handler(client, message):
         hit = True
     if uid in LOGIN_STATES:
         await _cleanup_login(uid)
+        hit = True
+    if uid in SETTING_STATES:
+        SETTING_STATES.pop(uid, None)
         hit = True
     ev = ACTIVE_BATCHES.get(uid)
     if ev is not None:
@@ -995,11 +1041,373 @@ async def handle_login_step(client, message):
         return
 
 
+# --- USER SETTINGS (customize panel) ---
+SETTINGS_FILE = os.environ.get("SETTINGS_FILE", "user_settings.json")
+SETTING_STATES = {}  # uid -> {"action": ...}
+
+DEFAULT_SETTINGS = {
+    "chat_id": None,        # files kahan bheji jayein (None = khud ko)
+    "rename_tag": None,     # filename me [Tag] prefix
+    "caption": None,        # caption template ({filename} supported)
+    "replace_words": [],    # [[old, new], ...]
+    "remove_words": [],     # [w1, w2, ...]
+    "thumb_file_id": None,  # custom thumbnail
+    "pdf_wm": None,         # PDF watermark text
+    "video_wm": None,       # video watermark text
+    "upload_as_doc": False, # video ko document ki tarah bhejo
+}
+
+
+def get_settings(uid):
+    all_s = _load_json(SETTINGS_FILE, {})
+    s = dict(DEFAULT_SETTINGS)
+    s.update(all_s.get(str(uid), {}))
+    return s
+
+
+def save_settings(uid, s):
+    all_s = _load_json(SETTINGS_FILE, {})
+    all_s[str(uid)] = s
+    _save_json(SETTINGS_FILE, all_s)
+
+
+def update_setting(uid, key, value):
+    s = get_settings(uid)
+    s[key] = value
+    save_settings(uid, s)
+
+
+def reset_settings(uid):
+    all_s = _load_json(SETTINGS_FILE, {})
+    all_s.pop(str(uid), None)
+    _save_json(SETTINGS_FILE, all_s)
+
+
+def settings_keyboard(uid):
+    s = get_settings(uid)
+    on = lambda v: "✅" if v else ""
+    um = "Document" if s["upload_as_doc"] else "Auto"
+    kb = [
+        [InlineKeyboardButton("Set Chat ID", callback_data="st_chat"),
+         InlineKeyboardButton("Set Rename Tag", callback_data="st_rename")],
+        [InlineKeyboardButton("Caption", callback_data="st_caption"),
+         InlineKeyboardButton("Replace Words", callback_data="st_replace")],
+        [InlineKeyboardButton("Remove Words", callback_data="st_remove"),
+         InlineKeyboardButton("Reset", callback_data="st_reset")],
+        [InlineKeyboardButton("Session Login", callback_data="st_login"),
+         InlineKeyboardButton("Logout", callback_data="st_logout")],
+        [InlineKeyboardButton(f"{on(s['thumb_file_id'])} Set Thumbnail".strip(),
+                              callback_data="st_thumb"),
+         InlineKeyboardButton("Remove Thumbnail", callback_data="st_unthumb")],
+        [InlineKeyboardButton(f"{on(s['pdf_wm'])} PDF Wtmrk".strip(),
+                              callback_data="st_pdfwm"),
+         InlineKeyboardButton(f"{on(s['video_wm'])} Video Wtmrk".strip(),
+                              callback_data="st_videowm")],
+        [InlineKeyboardButton(f"Upload Method: {um}",
+                              callback_data="st_uploadmethod")],
+        [InlineKeyboardButton("Report Errors ↗", callback_data="st_report")],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+
+def apply_filename_rules(filename, s):
+    """remove_words -> replace_words -> rename_tag lagao."""
+    name, ext = os.path.splitext(filename)
+    for w in s.get("remove_words", []):
+        if w:
+            name = name.replace(w, "")
+    for pair in s.get("replace_words", []):
+        if isinstance(pair, (list, tuple)) and len(pair) == 2 and pair[0]:
+            name = name.replace(pair[0], pair[1])
+    name = re.sub(r"\.{2,}", ".", name)
+    name = re.sub(r"\s{2,}", " ", name).strip(" .")
+    tag = s.get("rename_tag")
+    if tag and not name.startswith(f"[{tag}]"):
+        name = f"[{tag}] {name}"
+    name = re.sub(r'[\\/*?:"<>|]', "", name).strip()
+    if not name:
+        name = "file"
+    return name + ext
+
+
+def apply_pdf_watermark(pdf_path, text, tmpdir):
+    """Har page par tircha text watermark lagao (pypdf + reportlab)."""
+    try:
+        from pypdf import PdfReader, PdfWriter
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.pagesizes import A4
+        import io
+        reader = PdfReader(pdf_path)
+        if not reader.pages:
+            return pdf_path
+        packet = io.BytesIO()
+        c = canvas.Canvas(packet, pagesize=A4)
+        c.setFont("Helvetica-Bold", 36)
+        c.setFillGray(0.55)
+        c.saveState()
+        c.translate(297, 420)
+        c.rotate(45)
+        c.drawCentredString(0, 0, text[:60])
+        c.restoreState()
+        c.save()
+        packet.seek(0)
+        wm_page = PdfReader(packet).pages[0]
+        writer = PdfWriter()
+        for page in reader.pages:
+            page.merge_page(wm_page)
+            writer.add_page(page)
+        out = os.path.join(tmpdir, "wm_" + os.path.basename(pdf_path))
+        with open(out, "wb") as f:
+            writer.write(f)
+        return out
+    except Exception as e:
+        print(f"PDF watermark failed: {e}", flush=True)
+        return pdf_path
+
+
+def apply_video_watermark(video_path, text, tmpdir):
+    """Video par text watermark jalao (ffmpeg). Slow ho sakta hai."""
+    try:
+        import subprocess
+        if not shutil.which("ffmpeg"):
+            print("ffmpeg nahi mila, video watermark skip", flush=True)
+            return video_path
+        out = os.path.join(tmpdir, "wm_" + os.path.basename(video_path))
+        safe = re.sub(r"[^a-zA-Z0-9 _-]", "", text)[:40] or "VILLAN"
+        cmd = ["ffmpeg", "-y", "-i", video_path, "-vf",
+               f"drawtext=text='{safe}':fontsize=28:fontcolor=white@0.85:x=20:y=20",
+               "-c:a", "copy", "-preset", "ultrafast", out]
+        subprocess.run(cmd, capture_output=True, timeout=7200, check=True)
+        if os.path.exists(out) and os.path.getsize(out) > 0:
+            return out
+        return video_path
+    except Exception as e:
+        print(f"Video watermark failed: {e}", flush=True)
+        return video_path
+
+
+@app.on_message(filters.command("settings") & filters.private)
+async def settings_handler(client, message):
+    uid = message.chat.id
+    if not _is_allowed(uid):
+        await message.reply_text("⛔ Tumhe is bot ki permission nahi hai.")
+        return
+    await message.reply_text(
+        "⚙️ **Customize by your end and Configure your settings...**",
+        parse_mode=enums.ParseMode.MARKDOWN,
+        reply_markup=settings_keyboard(uid),
+    )
+
+
+@app.on_callback_query()
+async def settings_callbacks(client, query):
+    uid = query.from_user.id
+    data = query.data or ""
+    if not data.startswith("st_"):
+        return
+    if not _is_allowed(uid):
+        try:
+            await query.answer("⛔ Permission nahi hai.", show_alert=True)
+        except Exception:
+            pass
+        return
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    if data == "st_chat":
+        SETTING_STATES[uid] = {"action": "set_chat_id"}
+        await query.message.reply_text(
+            "📨 **Set Chat ID**\n\nFiles kis chat me bheji jayein, wo ID bhejo\n"
+            "(jaise `-1001234567890`).\nWapas apne paas bhejne ke liye `off` bhejo.",
+            parse_mode=enums.ParseMode.MARKDOWN)
+    elif data == "st_rename":
+        SETTING_STATES[uid] = {"action": "set_rename"}
+        await query.message.reply_text(
+            "🏷️ **Set Rename Tag**\n\nEk tag bhejo, file ka naam `[Tag] naam.ext` hoga.\n"
+            "Hatane ke liye `off` bhejo.",
+            parse_mode=enums.ParseMode.MARKDOWN)
+    elif data == "st_caption":
+        SETTING_STATES[uid] = {"action": "set_caption"}
+        await query.message.reply_text(
+            "💬 **Caption**\n\nCaption template bhejo. `{filename}` likhne par file ka naam aayega.\n"
+            "Jaise: `🔥 {filename}`\nHatane ke liye `off` bhejo.",
+            parse_mode=enums.ParseMode.MARKDOWN)
+    elif data == "st_replace":
+        SETTING_STATES[uid] = {"action": "set_replace"}
+        await query.message.reply_text(
+            "🔄 **Replace Words**\n\nHar line par `purana | naya` bhejo.\n"
+            "Jaise:\n`x265 | x264`\n`1080p | 720p`\nHatane ke liye `off` bhejo.",
+            parse_mode=enums.ParseMode.MARKDOWN)
+    elif data == "st_remove":
+        SETTING_STATES[uid] = {"action": "set_remove"}
+        await query.message.reply_text(
+            "🧹 **Remove Words**\n\nComma se alag karke words bhejo, jo filename se hatane hain.\n"
+            "Jaise: `x265, PSA, 1080p`\nHatane ke liye `off` bhejo.",
+            parse_mode=enums.ParseMode.MARKDOWN)
+    elif data == "st_reset":
+        reset_settings(uid)
+        await query.message.reply_text("♻️ Sab settings reset ho gayi!",
+                                       reply_markup=settings_keyboard(uid))
+    elif data == "st_login":
+        await _cleanup_login(uid)
+        LOGIN_STATES[uid] = {"step": "PHONE"}
+        await query.message.reply_text(
+            "📱 **Login - Step 1/3**\n\nApna phone number bhejo country code ke saath\n"
+            "(jaise `+919876543210`)",
+            parse_mode=enums.ParseMode.MARKDOWN)
+    elif data == "st_logout":
+        await _cleanup_login(uid)
+        await _logout_user(uid)
+        await query.message.reply_text("👋 Logout ho gaya. `/login` se dobara login karo.")
+    elif data == "st_thumb":
+        SETTING_STATES[uid] = {"action": "set_thumb"}
+        await query.message.reply_text(
+            "🖼️ **Set Thumbnail**\n\nThumbnail ke liye ek **photo** bhejo.",
+            parse_mode=enums.ParseMode.MARKDOWN)
+    elif data == "st_unthumb":
+        update_setting(uid, "thumb_file_id", None)
+        await query.message.reply_text("✅ Thumbnail hata diya.",
+                                       reply_markup=settings_keyboard(uid))
+    elif data == "st_pdfwm":
+        SETTING_STATES[uid] = {"action": "set_pdfwm"}
+        await query.message.reply_text(
+            "📄 **PDF Watermark**\n\nWatermark text bhejo (PDF ke har page par tircha lagega).\n"
+            "Hatane ke liye `off` bhejo.",
+            parse_mode=enums.ParseMode.MARKDOWN)
+    elif data == "st_videowm":
+        SETTING_STATES[uid] = {"action": "set_videowm"}
+        await query.message.reply_text(
+            "🎬 **Video Watermark**\n\nWatermark text bhejo (video par likha aayega).\n"
+            "⚠️ Note: video dobara encode hogi, isliye **slow** hoga.\n"
+            "Hatane ke liye `off` bhejo.",
+            parse_mode=enums.ParseMode.MARKDOWN)
+    elif data == "st_uploadmethod":
+        s = get_settings(uid)
+        update_setting(uid, "upload_as_doc", not s["upload_as_doc"])
+        mode = "Document" if not s["upload_as_doc"] else "Auto"
+        await query.message.reply_text(f"✅ Upload method: **{mode}**",
+                                       parse_mode=enums.ParseMode.MARKDOWN,
+                                       reply_markup=settings_keyboard(uid))
+    elif data == "st_report":
+        SETTING_STATES[uid] = {"action": "report"}
+        await query.message.reply_text(
+            "🐞 **Report Errors**\n\nKya problem aayi? Detail me likh ke bhejo, owner tak pahuncha dunga.",
+            parse_mode=enums.ParseMode.MARKDOWN)
+
+
+async def handle_setting_input(client, message):
+    uid = message.chat.id
+    st = SETTING_STATES.get(uid)
+    if not st:
+        return
+    action = st["action"]
+    text = (message.text or "").strip()
+
+    async def done(msg):
+        SETTING_STATES.pop(uid, None)
+        await message.reply_text(msg, parse_mode=enums.ParseMode.MARKDOWN,
+                                 reply_markup=settings_keyboard(uid))
+
+    if action == "set_chat_id":
+        if text.lower() == "off":
+            update_setting(uid, "chat_id", None)
+            await done("✅ Chat ID hata diya. Files ab tumhe milengi.")
+            return
+        try:
+            cid = int(text)
+        except ValueError:
+            await message.reply_text("❌ Sahi ID bhejo, jaise `-1001234567890`.")
+            return
+        update_setting(uid, "chat_id", cid)
+        await done(f"✅ Chat ID set: `{cid}`\nAb files wahi bheji jayengi.")
+    elif action == "set_rename":
+        if text.lower() == "off":
+            update_setting(uid, "rename_tag", None)
+            await done("✅ Rename tag hata diya.")
+        else:
+            update_setting(uid, "rename_tag", text[:40])
+            await done(f"✅ Tag set: `[{text[:40]}]`")
+    elif action == "set_caption":
+        if text.lower() == "off":
+            update_setting(uid, "caption", None)
+            await done("✅ Caption hata diya.")
+        else:
+            update_setting(uid, "caption", text[:500])
+            await done("✅ Caption set ho gaya.")
+    elif action == "set_replace":
+        if text.lower() == "off":
+            update_setting(uid, "replace_words", [])
+            await done("✅ Replace rules hata diye.")
+        else:
+            pairs = []
+            for line in text.split("\n"):
+                if "|" in line:
+                    old, new = line.split("|", 1)
+                    old, new = old.strip(), new.strip()
+                    if old:
+                        pairs.append([old, new])
+            update_setting(uid, "replace_words", pairs)
+            await done(f"✅ `{len(pairs)}` replace rules set.")
+    elif action == "set_remove":
+        if text.lower() == "off":
+            update_setting(uid, "remove_words", [])
+            await done("✅ Remove words hata diye.")
+        else:
+            words = [w.strip() for w in text.split(",") if w.strip()]
+            update_setting(uid, "remove_words", words)
+            await done(f"✅ `{len(words)}` words hatane ke liye set.")
+    elif action == "set_pdfwm":
+        if text.lower() == "off":
+            update_setting(uid, "pdf_wm", None)
+            await done("✅ PDF watermark hata diya.")
+        else:
+            update_setting(uid, "pdf_wm", text[:60])
+            await done(f"✅ PDF watermark set: `{text[:60]}`")
+    elif action == "set_videowm":
+        if text.lower() == "off":
+            update_setting(uid, "video_wm", None)
+            await done("✅ Video watermark hata diya.")
+        else:
+            update_setting(uid, "video_wm", text[:40])
+            await done(f"✅ Video watermark set: `{text[:40]}`\n⚠️ Video slow encode hogi.")
+    elif action == "report":
+        if OWNER_ID:
+            try:
+                await client.send_message(
+                    OWNER_ID,
+                    f"🐞 **Error report** from `{uid}`:\n\n{text[:1000]}",
+                    parse_mode=enums.ParseMode.MARKDOWN)
+                await done("✅ Report owner ko bhej diya.")
+            except Exception:
+                await done("❌ Report nahi bheja ja saka.")
+        else:
+            await done("❌ Owner set nahi hai.")
+
+
+@app.on_message(filters.photo & filters.private)
+async def thumb_photo_handler(client, message):
+    uid = message.chat.id
+    st = SETTING_STATES.get(uid)
+    if not st or st.get("action") != "set_thumb":
+        return
+    if not _is_allowed(uid):
+        SETTING_STATES.pop(uid, None)
+        await message.reply_text("⛔ Tumhe is bot ki permission nahi hai.")
+        return
+    SETTING_STATES.pop(uid, None)
+    file_id = message.photo[-1].file_id
+    update_setting(uid, "thumb_file_id", file_id)
+    await message.reply_text("✅ Thumbnail set ho gaya!",
+                             reply_markup=settings_keyboard(uid))
+
+
 @app.on_message(
     filters.text
     & filters.private
     & ~filters.command(
-        ["start", "batch", "cancel", "login", "logout",
+        ["start", "batch", "cancel", "login", "logout", "settings",
          "allow", "unallow", "users", "paid", "plan"]
     )
 )
@@ -1021,6 +1429,11 @@ async def message_dispatcher(client, message):
         await message.reply_text(
             "⛔ Tumhe is bot ko use karne ki permission nahi hai.\nOwner se contact karo."
         )
+        return
+
+    # Settings input flow (koi setting ka jawab aa raha ho)
+    if user_id in SETTING_STATES:
+        await handle_setting_input(client, message)
         return
 
     if (
