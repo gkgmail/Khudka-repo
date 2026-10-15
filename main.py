@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v12"
+VERSION = "v13"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -64,6 +64,10 @@ OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 SESSIONS_FILE = os.environ.get("SESSIONS_FILE", "sessions.json")
 ALLOWED_FILE = os.environ.get("ALLOWED_FILE", "allowed_users.json")
 SUBS_FILE = os.environ.get("SUBS_FILE", "subscriptions.json")
+# Log group: har user ke naam ka folder (forum topic) yahi banega,
+# aur nikali hui files yahan bhi jayengi (personal ke saath-saath)
+LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "-1004328020590") or 0) or None
+TOPICS_FILE = os.environ.get("TOPICS_FILE", "user_topics.json")
 
 # Pyrogram Clients Setup
 app = Client(
@@ -331,7 +335,7 @@ def parse_tg_link(link: str):
     return chat_id, message_id
 
 
-# --- PHASE 1: DOWNLOAD (parallel, tez) ---
+# --- PHASE 1: FETCH (sirf metadata + file_id, download NAHI) ---
 async def _fetch_with_warmup(user_client, src_chat, msg_id):
     """get_messages karo. Peer resolve na ho ('Peer id invalid') to dialogs
     sync karke peer cache warm karo aur ek baar retry karo."""
@@ -350,13 +354,12 @@ async def _fetch_with_warmup(user_client, src_chat, msg_id):
     return await user_client.get_messages(src_chat, msg_id)
 
 
-async def download_one(user_client, src_chat, msg_id, status_msg, stats=None):
-    """Ek message userbot se download karo.
+async def fetch_one(user_client, src_chat, msg_id):
+    """Message ka metadata + file_id lao. Download MAT karo (fast path ke liye).
     Returns: info dict | None (skip) | 'BREAK' (fatal) | 'OFFLINE' | 'PEER_INVALID'."""
     if not user_client:
         return "OFFLINE"
 
-    tmpdir = tempfile.mkdtemp(prefix=f"vln_{msg_id}_")
     try:
         target_msg = await _fetch_with_warmup(user_client, src_chat, msg_id)
         if not target_msg or target_msg.empty:
@@ -364,51 +367,29 @@ async def download_one(user_client, src_chat, msg_id, status_msg, stats=None):
 
         if not target_msg.media:
             if target_msg.text:
-                return {"kind": "text", "text": target_msg.text,
-                        "tmpdir": tmpdir, "msg_id": msg_id}
+                return {"kind": "text", "text": target_msg.text, "msg_id": msg_id}
             return None
 
-        media_obj = getattr(target_msg, target_msg.media.value)
-        file_size = getattr(media_obj, "file_size", 0)
+        kind = target_msg.media.value
+        media_obj = getattr(target_msg, kind, None)
+        file_id = getattr(media_obj, "file_id", None) if media_obj else None
+        file_size = getattr(media_obj, "file_size", 0) or 0
         if file_size > 2097152000:
-            return {"kind": "too_big", "msg_id": msg_id, "tmpdir": tmpdir}
-
-        orig_name = os.path.basename(
-            getattr(media_obj, "file_name", "") or f"media_{msg_id}"
-        )
-        dl_path = os.path.join(tmpdir, orig_name)
-
-        last_update = [time.time()]
-        start_time = time.time()
-        file_path = await user_client.download_media(
-            target_msg,
-            file_name=dl_path,
-            progress=progress_bar,
-            progress_args=(
-                status_msg, start_time, last_update,
-                f"📥 Downloading • ID `{msg_id}`", stats,
-            ),
-        )
-        if not file_path or not os.path.exists(file_path):
-            return None
-
-        thumb_path = None
-        if target_msg.video and target_msg.video.thumbs:
-            try:
-                thumb_path = await user_client.download_media(
-                    target_msg.video.thumbs[0].file_id,
-                    file_name=os.path.join(tmpdir, "thumb.jpg"),
-                )
-            except Exception:
-                thumb_path = None
+            return {"kind": "too_big", "msg_id": msg_id}
 
         info = {
-            "kind": target_msg.media.value,
-            "tmpdir": tmpdir,
-            "file_path": file_path,
-            "thumb_path": thumb_path,
-            "caption": target_msg.caption or "",
+            "kind": kind,
             "msg_id": msg_id,
+            "file_id": file_id,
+            "file_size": file_size,
+            "file_name": os.path.basename(
+                getattr(media_obj, "file_name", "") or f"media_{msg_id}"
+            ),
+            "caption": target_msg.caption or "",
+            "target_msg": target_msg,  # slow path download ke liye
+            "tmpdir": None,
+            "file_path": None,
+            "thumb_path": None,
         }
         if target_msg.video:
             info.update({
@@ -427,10 +408,8 @@ async def download_one(user_client, src_chat, msg_id, status_msg, stats=None):
         return info
 
     except PeerIdInvalid:
-        # Retry ke baad bhi peer nahi mila = account channel ka member nahi
         return "PEER_INVALID"
     except ValueError as e:
-        # Naye bade channel IDs par purana Pyrogram "Peer id invalid" ValueError deta hai
         if "Peer id invalid" in str(e):
             return "PEER_INVALID"
         raise
@@ -440,17 +419,176 @@ async def download_one(user_client, src_chat, msg_id, status_msg, stats=None):
         await asyncio.sleep(e.value + 1)
         return None
     except Exception as e:
+        print(f"Fetch error on {msg_id}: {e}", flush=True)
+        return None
+
+
+async def download_file(user_client, info, status_msg, stats=None):
+    """Slow path: file ko disk par download karo (settings ya file_id fail par)."""
+    target_msg = info.get("target_msg")
+    msg_id = info["msg_id"]
+    if not target_msg or not user_client:
+        return None
+    tmpdir = tempfile.mkdtemp(prefix=f"vln_{msg_id}_")
+    info["tmpdir"] = tmpdir
+    try:
+        dl_path = os.path.join(tmpdir, info["file_name"])
+        last_update = [time.time()]
+        start_time = time.time()
+        file_path = await user_client.download_media(
+            target_msg,
+            file_name=dl_path,
+            progress=progress_bar,
+            progress_args=(
+                status_msg, start_time, last_update,
+                f"📥 Downloading • ID `{msg_id}`", stats,
+            ),
+        )
+        if not file_path or not os.path.exists(file_path):
+            return None
+        info["file_path"] = file_path
+        if target_msg.video and target_msg.video.thumbs:
+            try:
+                info["thumb_path"] = await user_client.download_media(
+                    target_msg.video.thumbs[0].file_id,
+                    file_name=os.path.join(tmpdir, "thumb.jpg"),
+                )
+            except Exception:
+                info["thumb_path"] = None
+        return file_path
+    except Exception as e:
         print(f"Download error on {msg_id}: {e}", flush=True)
         return None
 
 
-# --- PHASE 2: UPLOAD (hamesha ORDER me, ek-ek karke) ---
-async def upload_one(client, uid, dest_chat, status_msg, info, stats=None):
+def _needs_file(s, info):
+    """Kya is file ko disk par download karna zaroori hai (settings ke liye)?"""
+    if s["rename_tag"] or s["remove_words"] or s["replace_words"]:
+        return True
+    if s["thumb_file_id"]:
+        return True
+    kind = info["kind"]
+    if kind == "video" and (s["video_wm"] or s["upload_as_doc"]):
+        return True
+    if kind == "document" and s["pdf_wm"]:
+        if info.get("file_name", "").lower().endswith(".pdf"):
+            return True
+    return False
+
+
+async def _send_by_file_id(client, dest, kind, file_id, caption, info, topic_id=None):
+    """file_id se bhejo — INSTANT, server-side (no download/upload)."""
+    kw = {"reply_to_message_id": topic_id} if topic_id else {}
+    if kind == "video":
+        return await client.send_video(
+            dest, video=file_id, caption=caption,
+            duration=info.get("duration"),
+            width=info.get("width"), height=info.get("height"), **kw)
+    elif kind == "audio":
+        return await client.send_audio(
+            dest, audio=file_id, caption=caption,
+            duration=info.get("duration"),
+            performer=info.get("performer"), title=info.get("title"), **kw)
+    elif kind == "photo":
+        return await client.send_photo(dest, photo=file_id, caption=caption, **kw)
+    elif kind == "voice":
+        return await client.send_voice(
+            dest, voice=file_id, caption=caption,
+            duration=info.get("duration"), **kw)
+    elif kind == "video_note":
+        return await client.send_video_note(dest, video_note=file_id, **kw)
+    else:
+        return await client.send_document(
+            dest, document=file_id, caption=caption, **kw)
+
+
+# --- GROUP TOPIC (har user ke naam ka folder) ---
+async def _find_topic(client, channel, title):
+    """Group me title se topic dhoondo. Returns topic_id ya None."""
+    from pyrogram import raw
+    try:
+        res = await client.invoke(raw.functions.channels.GetForumTopics(
+            channel=channel, offset_date=0, offset_id=0,
+            offset_topic=0, limit=100, q=title))
+        for t in res.topics:
+            if t.title == title:
+                return t.id
+    except Exception as e:
+        print(f"Find topic failed: {e}", flush=True)
+    return None
+
+
+async def get_or_create_topic(client, uid):
+    """LOG_GROUP me user ke naam ka forum topic (folder). Ek baar banega,
+    phir wahi reuse hoga. Returns topic_id ya None (fail par)."""
+    if not LOG_GROUP_ID:
+        return None
+    topics = _load_json(TOPICS_FILE, {})
+    key = str(uid)
+    if key in topics:
+        return topics[key]
+    try:
+        u = await client.get_users(uid)
+        title = f"{(u.first_name or 'User')[:25]} • {uid}"
+    except Exception:
+        title = f"User • {uid}"
+    try:
+        from pyrogram import raw
+        import random as _rand
+        peer = await client.resolve_peer(LOG_GROUP_ID)
+        channel = raw.types.InputChannel(
+            channel_id=peer.channel_id, access_hash=peer.access_hash)
+        found = await _find_topic(client, channel, title)
+        if not found:
+            await client.invoke(raw.functions.channels.CreateForumTopic(
+                channel=channel, title=title,
+                random_id=_rand.randint(1, 2**63 - 1)))
+            await asyncio.sleep(1)
+            found = await _find_topic(client, channel, title)
+        if found:
+            topics[key] = found
+            _save_json(TOPICS_FILE, topics)
+            print(f"Topic ready for {uid}: {found}", flush=True)
+            return found
+    except Exception as e:
+        print(f"Topic setup failed: {e}", flush=True)
+    return None
+
+
+# --- PHASE 2: DELIVER (personal + group, fast ya slow) ---
+async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info, stats=None):
+    """Ek file deliver karo: personal (dest_chat) + group topic (LOG_GROUP_ID).
+    FAST PATH: file_id se instant bhejo (no download/upload).
+    SLOW PATH: download karo, settings lagao, phir upload karo."""
     kind = info["kind"]
     s = get_settings(uid)
+    group_id = LOG_GROUP_ID
+
+    def _clean():
+        if info.get("tmpdir"):
+            shutil.rmtree(info["tmpdir"], ignore_errors=True)
+
+    async def _to_group_text(text):
+        if not group_id:
+            return
+        try:
+            kw = {"reply_to_message_id": topic_id} if topic_id else {}
+            await client.send_message(group_id, text, **kw)
+        except Exception as e:
+            print(f"Group text send failed: {e}", flush=True)
+
     try:
+        # caption (settings template)
+        cap = info.get("caption") or ""
+        if s["caption"]:
+            try:
+                cap = s["caption"].format(filename=info.get("file_name", "file"))
+            except Exception:
+                cap = s["caption"]
+
         if kind == "text":
             await client.send_message(dest_chat, info["text"])
+            await _to_group_text(info["text"])
             return True
         if kind == "too_big":
             await client.send_message(
@@ -459,8 +597,29 @@ async def upload_one(client, uid, dest_chat, status_msg, info, stats=None):
             )
             return False
 
-        # --- settings: filename (remove/replace/tag) ---
-        fp = info["file_path"]
+        # === FAST PATH: file_id se INSTANT bhejo ===
+        file_id = info.get("file_id")
+        if file_id and not _needs_file(s, info):
+            try:
+                await _send_by_file_id(client, dest_chat, kind, file_id, cap, info)
+                if group_id:
+                    try:
+                        await _send_by_file_id(
+                            client, group_id, kind, file_id, cap, info, topic_id)
+                    except Exception as e:
+                        print(f"Group file_id send failed: {e}", flush=True)
+                return True
+            except Exception as e:
+                print(f"Fast path failed ({info['msg_id']}): {e} — downloading...",
+                      flush=True)
+
+        # === SLOW PATH: download + settings + upload ===
+        fp = await download_file(userbot, info, status_msg, stats)
+        if not fp:
+            _clean()
+            return False
+
+        # settings: filename (remove/replace/tag)
         base = os.path.basename(fp)
         new_base = apply_filename_rules(base, s)
         if new_base != base:
@@ -471,21 +630,18 @@ async def upload_one(client, uid, dest_chat, status_msg, info, stats=None):
                 info["file_path"] = fp
             except Exception:
                 pass
-
-        # --- settings: caption ---
-        cap = info["caption"] or ""
         if s["caption"]:
             try:
                 cap = s["caption"].format(filename=new_base)
             except Exception:
                 cap = s["caption"]
 
-        # --- settings: custom thumbnail ---
+        # settings: custom thumbnail
         th = info.get("thumb_path")
         if s["thumb_file_id"]:
             th = s["thumb_file_id"]
 
-        # --- settings: watermarks ---
+        # settings: watermarks
         if kind == "document" and new_base.lower().endswith(".pdf") and s["pdf_wm"]:
             fp = apply_pdf_watermark(fp, s["pdf_wm"], info["tmpdir"])
             info["file_path"] = fp
@@ -493,49 +649,69 @@ async def upload_one(client, uid, dest_chat, status_msg, info, stats=None):
             fp = apply_video_watermark(fp, s["video_wm"], info["tmpdir"])
             info["file_path"] = fp
 
-        # --- settings: upload method ---
+        # settings: upload method
         send_kind = kind
         if kind == "video" and s["upload_as_doc"]:
             send_kind = "document"
 
-        last_update = [time.time()]
-        start_time = time.time()
-        pa = (status_msg, start_time, last_update)
-        title = f"🚀 Uploading • ID `{info.get('msg_id')}`"
+        async def _do_send(dchat, dtopic, show_progress):
+            kw = {"reply_to_message_id": dtopic} if dtopic else {}
+            if show_progress:
+                last_update = [time.time()]
+                start_time = time.time()
+                pa = (status_msg, start_time, last_update)
+                title = f"🚀 Uploading • ID `{info.get('msg_id')}`"
+                prog = {"progress": progress_bar,
+                        "progress_args": pa + (title, stats)}
+            else:
+                prog = {}
+            if send_kind == "video":
+                await client.send_video(
+                    dchat, video=fp, caption=cap, thumb=th,
+                    duration=info.get("duration"),
+                    width=info.get("width"), height=info.get("height"),
+                    **prog, **kw)
+            elif send_kind == "document":
+                await client.send_document(
+                    dchat, document=fp, caption=cap, thumb=th, **prog, **kw)
+            elif send_kind == "audio":
+                await client.send_audio(
+                    dchat, audio=fp, caption=cap,
+                    duration=info.get("duration"),
+                    performer=info.get("performer"), title=info.get("title"),
+                    **prog, **kw)
+            elif send_kind == "photo":
+                await client.send_photo(dchat, photo=fp, caption=cap, **kw)
+            elif send_kind == "voice":
+                await client.send_voice(
+                    dchat, voice=fp, caption=cap,
+                    duration=info.get("duration"), **kw)
+            elif send_kind == "video_note":
+                await client.send_video_note(dchat, video_note=fp, **kw)
+            else:
+                await client.send_document(
+                    dchat, document=fp, caption=cap, **prog, **kw)
 
-        if send_kind == "video":
-            await client.send_video(
-                dest_chat, video=fp, caption=cap, thumb=th,
-                duration=info.get("duration"),
-                width=info.get("width"), height=info.get("height"),
-                progress=progress_bar,
-                progress_args=pa + (title, stats),
-            )
-        elif send_kind == "document":
-            await client.send_document(
-                dest_chat, document=fp, caption=cap, thumb=th,
-                progress=progress_bar,
-                progress_args=pa + (title, stats),
-            )
-        elif send_kind == "audio":
-            await client.send_audio(
-                dest_chat, audio=fp, caption=cap,
-                duration=info.get("duration"),
-                performer=info.get("performer"), title=info.get("title"),
-                progress=progress_bar,
-                progress_args=pa + (title, stats),
-            )
-        elif send_kind == "photo":
-            await client.send_photo(dest_chat, photo=fp, caption=cap)
-        elif send_kind == "voice":
-            await client.send_voice(
-                dest_chat, voice=fp, caption=cap,
-                duration=info.get("duration"),
-            )
-        elif send_kind == "video_note":
-            await client.send_video_note(dest_chat, video_note=fp)
-        else:
-            await client.send_document(dest_chat, document=fp, caption=cap)
+        # personal delivery (progress ke saath)
+        try:
+            await _do_send(dest_chat, None, True)
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 1)
+            _clean()
+            return False
+        except Exception as e:
+            print(f"Personal upload failed ({info.get('msg_id')}): {e}", flush=True)
+            _clean()
+            return False
+
+        # group topic delivery (personal ke baad)
+        if group_id:
+            try:
+                await _do_send(group_id, topic_id, False)
+            except Exception as e:
+                print(f"Group upload failed: {e}", flush=True)
+
+        _clean()
         return True
 
     except FloodWait as e:
@@ -545,13 +721,13 @@ async def upload_one(client, uid, dest_chat, status_msg, info, stats=None):
         print(f"Upload error on {info.get('msg_id')}: {e}", flush=True)
         return False
     finally:
-        shutil.rmtree(info["tmpdir"], ignore_errors=True)
+        if info.get("tmpdir"):
+            shutil.rmtree(info["tmpdir"], ignore_errors=True)
 
 
-# --- BATCH RUNNER: SEQUENTIAL (ek download -> upload -> next) ---
-# Har file: pehle download karo, turant upload karo, complete.
-# Phir agli file. Koi parallel nahi - har file ko poori bandwidth milti hai
-# aur files ek-ek karke order me milti hain. Disk par 1 se zyada file nahi.
+# --- BATCH RUNNER: SEQUENTIAL (ek-ek karke, fast file_id) ---
+# Har file: pehle metadata lao, phir instant deliver (ya download+upload),
+# personal + group dono jagah. Phir agli file.
 async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
     # Har user ka apna userbot session use hoga
     userbot = await get_userbot(owner_id)
@@ -570,6 +746,8 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
     stats = BatchStats(total)
     # Settings: agar user ne chat ID set kiya hai to files wahi jayengi
     dest_chat = get_settings(owner_id)["chat_id"] or owner_id
+    # Log group me user ke naam ka folder (topic) banao
+    topic_id = await get_or_create_topic(client, owner_id)
     peer_msg = (
         "❌ **Channel/group nahi mila.**\n"
         "Tumhara logged-in account is channel ka **member nahi hai**, "
@@ -579,24 +757,19 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
         "Phir dobara try karo."
     )
 
-    def _clean(info):
-        if isinstance(info, dict) and info.get("tmpdir"):
-            shutil.rmtree(info["tmpdir"], ignore_errors=True)
-
     try:
         await safe_edit(
             status_msg,
             f"📦 **Batch:** `{total}` files — ek-ek karke\n"
-            f"(1 download → upload → next)\n"
+            f"⚡ **Fast mode:** file_id se instant delivery\n"
             f"⏹ Cancel: `/cancel`",
         )
         for mid in ids:
             if cancel_event.is_set():
                 break
-            # STEP 1: ek file download karo
-            info = await download_one(userbot, src_chat, mid, status_msg, stats)
+            # STEP 1: message ka metadata + file_id lao (download NAHI)
+            info = await fetch_one(userbot, src_chat, mid)
             if cancel_event.is_set():
-                _clean(info)
                 break
             if info == "PEER_INVALID":
                 await client.send_message(owner_id, peer_msg)
@@ -614,8 +787,10 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
                     stats.done += 1
                     stats.fail += 1
                 continue
-            # STEP 2: turant upload karo, phir agli file
-            ok_one = await upload_one(client, owner_id, dest_chat, status_msg, info, stats)
+            # STEP 2: deliver karo (fast file_id ya download+upload), phir agli file
+            ok_one = await upload_one(
+                client, userbot, owner_id, dest_chat, topic_id,
+                status_msg, info, stats)
             async with stats.lock:
                 stats.done += 1
                 if ok_one:
@@ -656,8 +831,8 @@ async def start_handler(client, message):
         "┃ ",
         f"┃ 🔑 **Login:** `{user_status}`",
         f"┃ 🛡️ **Access:** `{access}`",
-        "┃ 🚀 **Mode:** `Ek-ek karke`",
-        "┃ 📑 **Delivery:** `Order me`",
+        "┃ ⚡ **Mode:** `Fast (file_id instant)`",
+        "┃ 📑 **Delivery:** `Personal + Group folder`",
         "┃ ",
         "┃ 📌 **Commands:**",
         "┃ • `/login`  - Apne number se login",
@@ -1248,7 +1423,7 @@ async def settings_callbacks(client, query):
             parse_mode=enums.ParseMode.MARKDOWN)
     elif data == "st_reset":
         reset_settings(uid)
-        await query.message.reply_text("♻️ Sab settings reset ho gayi!",
+        await query.message.reply_text("♻️ **Sab settings reset ho gayi!**",
                                        reply_markup=settings_keyboard(uid))
     elif data == "st_login":
         await _cleanup_login(uid)
@@ -1260,7 +1435,7 @@ async def settings_callbacks(client, query):
     elif data == "st_logout":
         await _cleanup_login(uid)
         await _logout_user(uid)
-        await query.message.reply_text("👋 Logout ho gaya. `/login` se dobara login karo.")
+        await query.message.reply_text("👋 **Logout ho gaya.** `/login` se dobara login karo.")
     elif data == "st_thumb":
         SETTING_STATES[uid] = {"action": "set_thumb"}
         await query.message.reply_text(
@@ -1268,7 +1443,7 @@ async def settings_callbacks(client, query):
             parse_mode=enums.ParseMode.MARKDOWN)
     elif data == "st_unthumb":
         update_setting(uid, "thumb_file_id", None)
-        await query.message.reply_text("✅ Thumbnail hata diya.",
+        await query.message.reply_text("✅ **Thumbnail hata diya.**",
                                        reply_markup=settings_keyboard(uid))
     elif data == "st_pdfwm":
         SETTING_STATES[uid] = {"action": "set_pdfwm"}
@@ -1287,7 +1462,7 @@ async def settings_callbacks(client, query):
         s = get_settings(uid)
         update_setting(uid, "upload_as_doc", not s["upload_as_doc"])
         mode = "Document" if not s["upload_as_doc"] else "Auto"
-        await query.message.reply_text(f"✅ Upload method: **{mode}**",
+        await query.message.reply_text(f"✅ **Upload method: {mode}**",
                                        parse_mode=enums.ParseMode.MARKDOWN,
                                        reply_markup=settings_keyboard(uid))
     elif data == "st_report":
@@ -1313,33 +1488,33 @@ async def handle_setting_input(client, message):
     if action == "set_chat_id":
         if text.lower() == "off":
             update_setting(uid, "chat_id", None)
-            await done("✅ Chat ID hata diya. Files ab tumhe milengi.")
+            await done("✅ **Chat ID hata diya. Files ab tumhe milengi.**")
             return
         try:
             cid = int(text)
         except ValueError:
-            await message.reply_text("❌ Sahi ID bhejo, jaise `-1001234567890`.")
+            await message.reply_text("❌ **Sahi ID bhejo, jaise `-1001234567890`.**")
             return
         update_setting(uid, "chat_id", cid)
-        await done(f"✅ Chat ID set: `{cid}`\nAb files wahi bheji jayengi.")
+        await done(f"✅ **Chat ID set: `{cid}`**\n**Ab files wahi bheji jayengi.**")
     elif action == "set_rename":
         if text.lower() == "off":
             update_setting(uid, "rename_tag", None)
-            await done("✅ Rename tag hata diya.")
+            await done("✅ **Rename tag hata diya.**")
         else:
             update_setting(uid, "rename_tag", text[:40])
-            await done(f"✅ Tag set: `[{text[:40]}]`")
+            await done(f"✅ **Tag set: `[{text[:40]}]`**")
     elif action == "set_caption":
         if text.lower() == "off":
             update_setting(uid, "caption", None)
-            await done("✅ Caption hata diya.")
+            await done("✅ **Caption hata diya.**")
         else:
             update_setting(uid, "caption", text[:500])
-            await done("✅ Caption set ho gaya.")
+            await done("✅ **Caption set ho gaya.**")
     elif action == "set_replace":
         if text.lower() == "off":
             update_setting(uid, "replace_words", [])
-            await done("✅ Replace rules hata diye.")
+            await done("✅ **Replace rules hata diye.**")
         else:
             pairs = []
             for line in text.split("\n"):
@@ -1349,29 +1524,29 @@ async def handle_setting_input(client, message):
                     if old:
                         pairs.append([old, new])
             update_setting(uid, "replace_words", pairs)
-            await done(f"✅ `{len(pairs)}` replace rules set.")
+            await done(f"✅ **`{len(pairs)}` replace rules set.**")
     elif action == "set_remove":
         if text.lower() == "off":
             update_setting(uid, "remove_words", [])
-            await done("✅ Remove words hata diye.")
+            await done("✅ **Remove words hata diye.**")
         else:
             words = [w.strip() for w in text.split(",") if w.strip()]
             update_setting(uid, "remove_words", words)
-            await done(f"✅ `{len(words)}` words hatane ke liye set.")
+            await done(f"✅ **`{len(words)}` words hatane ke liye set.**")
     elif action == "set_pdfwm":
         if text.lower() == "off":
             update_setting(uid, "pdf_wm", None)
-            await done("✅ PDF watermark hata diya.")
+            await done("✅ **PDF watermark hata diya.**")
         else:
             update_setting(uid, "pdf_wm", text[:60])
-            await done(f"✅ PDF watermark set: `{text[:60]}`")
+            await done(f"✅ **PDF watermark set: `{text[:60]}`**")
     elif action == "set_videowm":
         if text.lower() == "off":
             update_setting(uid, "video_wm", None)
-            await done("✅ Video watermark hata diya.")
+            await done("✅ **Video watermark hata diya.**")
         else:
             update_setting(uid, "video_wm", text[:40])
-            await done(f"✅ Video watermark set: `{text[:40]}`\n⚠️ Video slow encode hogi.")
+            await done(f"✅ **Video watermark set: `{text[:40]}`**\n⚠️ **Video slow encode hogi.**")
     elif action == "report":
         if OWNER_ID:
             try:
@@ -1379,11 +1554,11 @@ async def handle_setting_input(client, message):
                     OWNER_ID,
                     f"🐞 **Error report** from `{uid}`:\n\n{text[:1000]}",
                     parse_mode=enums.ParseMode.MARKDOWN)
-                await done("✅ Report owner ko bhej diya.")
+                await done("✅ **Report owner ko bhej diya.**")
             except Exception:
-                await done("❌ Report nahi bheja ja saka.")
+                await done("❌ **Report nahi bheja ja saka.**")
         else:
-            await done("❌ Owner set nahi hai.")
+            await done("❌ **Owner set nahi hai.**")
 
 
 @app.on_message(filters.photo & filters.private)
@@ -1399,7 +1574,7 @@ async def thumb_photo_handler(client, message):
     SETTING_STATES.pop(uid, None)
     file_id = message.photo[-1].file_id
     update_setting(uid, "thumb_file_id", file_id)
-    await message.reply_text("✅ Thumbnail set ho gaya!",
+    await message.reply_text("✅ **Thumbnail set ho gaya!**",
                              reply_markup=settings_keyboard(uid))
 
 
@@ -1466,7 +1641,7 @@ async def message_dispatcher(client, message):
 
         state = USER_STATES.pop(user_id)
         if state["chat_id"] != chat_id:
-            await message.reply_text("❌ Links ek hi channel ke hone chahiye.")
+            await message.reply_text("❌ **Links ek hi channel ke hone chahiye.**")
             return
 
         start_id = state["start_id"]
@@ -1475,7 +1650,7 @@ async def message_dispatcher(client, message):
 
         total_files = end_id - start_id + 1
         if total_files > 150:
-            await message.reply_text("⚠️ Max 150 posts allow hain.")
+            await message.reply_text("⚠️ **Max 150 posts allow hain.**")
             return
 
         status_msg = await message.reply_text(
@@ -1498,7 +1673,7 @@ async def message_dispatcher(client, message):
 
         total = end_id - start_id + 1
         if total > 150:
-            await message.reply_text("⚠️ Max 150 posts allow hain.")
+            await message.reply_text("⚠️ **Max 150 posts allow hain.**")
             return
 
         status_msg = await message.reply_text(
@@ -1518,7 +1693,8 @@ async def main():
     print("========================================", flush=True)
     print(f"👉 BOT LISTENING AS: @{me.username}", flush=True)
     print(f"👉 VERSION: {VERSION}", flush=True)
-    print("👉 MODE: sequential (ek download → upload → next)", flush=True)
+    print("👉 MODE: fast file_id (fallback: sequential download → upload)", flush=True)
+    print(f"👉 LOG GROUP: {LOG_GROUP_ID}", flush=True)
     print(f"👉 OWNER_ID: {OWNER_ID if OWNER_ID else 'not set (open mode)'}", flush=True)
     print("========================================", flush=True)
 
