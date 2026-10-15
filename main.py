@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v20"
+VERSION = "v21"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -762,14 +762,19 @@ async def _find_topic_id(client, channel, title):
     return None
 
 
-async def get_or_create_topic(client, uid):
+async def get_or_create_topic(userbot, uid):
     """LOG_GROUP me user ke naam ka forum topic (folder). Ek baar banega,
     phir wahi reuse hoga.
-    Returns: topic ID (raw API me top_msg_id ke liye).
-    Fail par None."""
+    NOTE: userbot use hota hai kyunki BOTS channels.GetForumTopics/
+    CreateForumTopic use NAHI kar sakte (BOT_METHOD_INVALID)!
+    Returns: topic ID. Fail par None."""
     print(f"[TOPIC] Called for uid={uid}, LOG_GROUP_ID={LOG_GROUP_ID}", flush=True)
     if not LOG_GROUP_ID:
         return None
+    if not userbot:
+        print(f"[TOPIC] userbot nahi hai, topic nahi ban sakta", flush=True)
+        return None
+    client = userbot  # Topic management userbot se (bot se nahi!)
     try:
         u = await client.get_users(uid)
         title = f"{(u.first_name or 'User')[:25]} • {uid}"
@@ -1033,7 +1038,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
     # Settings: agar user ne chat ID set kiya hai to files wahi jayengi
     dest_chat = get_settings(owner_id)["chat_id"] or owner_id
     # Log group me user ke naam ka folder (topic) banao
-    topic_id = await get_or_create_topic(client, owner_id)
+    topic_id = await get_or_create_topic(userbot, owner_id)
     peer_msg = (
         "❌ **Channel/group nahi mila.**\n"
         "Tumhara logged-in account is channel ka **member nahi hai**, "
