@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v22"
+VERSION = "v23"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -59,6 +59,8 @@ PROGRESS_EVERY = float(os.environ.get("PROGRESS_EVERY", "5"))
 # /login command sirf is Telegram user ID ke liye (0 = sab ke liye khula).
 # Apni ID @userinfobot se le sakte ho. Bot public hai to set karna behtar hai.
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
+# Owner ka username (contact/buy ke liye dikhega)
+OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "@THE_OG_VILLAN").strip()
 # Per-user sessions, allowlist aur paid subscriptions ki files
 # DATA_DIR par rakho taaki Koyeb Volume lage to redeploy par na udein.
 # (Volume: Koyeb dashboard -> Volumes -> Create, mount path /data,
@@ -384,9 +386,17 @@ async def progress_bar(
     remaining_bytes = max(total - current, 0)
     time_left = round(remaining_bytes / speed) if speed > 0 else 0
 
+    # ━━━ PREMIUM CARD ━━━
     lines = [
-        "╭━━━━━━━━━━━━━━━━━━━━╮",
-        "┃ 🦅 **VILLAN CLONER** 🦅",
+        "✦ ━━━━━━━━━━━━━━━━━ ✦",
+        "      ⚡ **VILLAN** ⚡",
+        "✦ ━━━━━━━━━━━━━━━━━ ✦",
+        "",
+        f"{action_title}",
+        f"`{bar}`  **{percentage:.0f}%**",
+        "",
+        f"🚀 `{humanbytes(speed)}/s`   💾 `{humanbytes(current)}` **/** `{humanbytes(total)}`",
+        f"⏳ `{time_formatter(time_left * 1000)}` left",
     ]
     if stats is not None:
         async with stats.lock:
@@ -397,19 +407,11 @@ async def progress_bar(
         avg = max(now - bstart, 0.001) / max(done, 1)
         eta_b = avg * max(total_b - done, 0)
         lines += [
-            f"┃ 📦 **Batch:** `{done}/{total_b}` (`{b_pct:.0f}%`)",
-            f"┃ ✅ `{ok}` ok • ❌ `{fail}` fail",
-            f"┃ ⏳ **Batch ETA:** `~{time_formatter(eta_b * 1000)}`",
-            "┣━━━━━━━━━━━━━━━━━━━━┫",
+            "",
+            "━━━━━━━━━━━━━━━━━━━",
+            f"📦 `{done}`**/**`{total_b}`  (`{b_pct:.0f}%`)   ✅ `{ok}`   ❌ `{fail}`",
+            f"⏳ Batch ETA `~{time_formatter(eta_b * 1000)}`",
         ]
-    lines += [
-        f"┃ ⚡ **{action_title}**",
-        f"┃ `[{bar}]` **{percentage:.1f}%**",
-        f"┃ 🚀 **Speed:** `{humanbytes(speed)}/s`",
-        f"┃ 💾 **Downloaded:** `{humanbytes(current)} / {humanbytes(total)}`",
-        f"┃ ⏳ **File ETA:** `{time_formatter(time_left * 1000)}`",
-        "╰━━━━━━━━━━━━━━━━━━━━╯",
-    ]
     await safe_edit(message, "\n".join(lines))
 
 
@@ -1061,6 +1063,12 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
         "Phir dobara try karo."
     )
 
+    # Status message ko PIN karo taaki upar dikhe
+    try:
+        await client.pin_chat_message(
+            owner_id, status_msg.id, disable_notification=True)
+    except Exception as e:
+        print(f"Pin failed: {e}", flush=True)
     try:
         await safe_edit(
             status_msg,
@@ -1136,16 +1144,18 @@ async def start_handler(client, message):
         f"┃ 🔑 **Login:** `{user_status}`",
         f"┃ 🛡️ **Access:** `{access}`",
         "┃ ⚡ **Mode:** `Fast (file_id instant)`",
-        "┃ 📑 **Delivery:** `Personal + Group folder`",
         "┃ ",
         "┃ 📌 **Commands:**",
         "┃ • `/login`  - Apne number se login",
-        "┃ • `/logout` - Logout",
-        "┃ • `/plan`   - Apna plan dekho",
         "┃ • `/batch`  - Range extraction",
         "┃ • `/settings` - Customize panel",
+        "┃ • `/plan`   - Apna plan dekho",
+        "┃ • `/buy`    - Premium kharido",
+        "┃ • `/help`   - Kaise use karein",
         "┃ • `/cancel` - Active queue stop",
         "┃ • Direct link paste karein",
+        "┃ ",
+        f"┃ 👑 **Owner:** `{OWNER_USERNAME}`",
     ]
     if _is_owner(uid):
         start_lines += [
@@ -1316,6 +1326,48 @@ async def plan_handler(client, message):
     login = "🟢 Logged in" if has_session else "🔴 Not logged in (`/login` karo)"
     await message.reply_text(
         f"📋 **Tumhara plan:** {plan}\n🔑 **Login:** {login}",
+        parse_mode=enums.ParseMode.MARKDOWN,
+    )
+
+
+@app.on_message(filters.command("help") & filters.private)
+async def help_handler(client, message):
+    """Bot kaise use karein — poori guide."""
+    help_text = (
+        "🦅 **VILLAN BOT — HELP**\n\n"
+        "**Bot kaise use karein:**\n\n"
+        "1️⃣ `/login` — Apne Telegram number se login karo\n"
+        "   (OTP aayega, 2-step password ho to wo bhi)\n\n"
+        "2️⃣ `/batch` — Phir channel ka **start link** bhejo,\n"
+        "   phir **end link** bhejo\n"
+        "   _Ya seedha ek message me range bhejo:_\n"
+        "   `https://t.me/c/123456789/100-110`\n\n"
+        "3️⃣ Files tumhe mil jayengi ⚡\n\n"
+        "**Commands:**\n"
+        "• `/start` — Bot shuru karo\n"
+        "• `/login` — Number se login\n"
+        "• `/logout` — Logout\n"
+        "• `/batch` — Batch download\n"
+        "• `/settings` — Rename, caption, watermark\n"
+        "• `/plan` — Apna plan dekho\n"
+        "• `/buy` — Premium kharido\n"
+        "• `/cancel` — Chal raha kaam roko\n\n"
+        f"👑 **Owner:** `{OWNER_USERNAME}`\n"
+        "_Access ya premium ke liye owner se contact karo._"
+    )
+    await message.reply_text(help_text, parse_mode=enums.ParseMode.MARKDOWN)
+
+
+@app.on_message(filters.command("buy") & filters.private)
+async def buy_handler(client, message):
+    """Premium kharidne ke liye owner ka username dikhao."""
+    await message.reply_text(
+        "💎 **VILLAN PREMIUM** 💎\n\n"
+        "Premium lene ke liye owner se contact karo:\n"
+        f"👑 `{OWNER_USERNAME}`\n\n"
+        "Unhe message karo:\n"
+        "`Hi, mujhe premium chahiye`\n\n"
+        "Payment ke baad tumhara plan activate ho jayega! 🚀",
         parse_mode=enums.ParseMode.MARKDOWN,
     )
 
@@ -1890,7 +1942,7 @@ async def thumb_photo_handler(client, message):
     & filters.private
     & ~filters.command(
         ["start", "batch", "cancel", "login", "logout", "settings",
-         "allow", "unallow", "users", "paid", "plan"]
+         "allow", "unallow", "users", "paid", "plan", "help", "buy"]
     )
 )
 async def message_dispatcher(client, message):
