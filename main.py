@@ -42,7 +42,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v9"
+VERSION = "v10"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -510,7 +510,12 @@ async def upload_one(client, dest_chat, status_msg, info, stats=None):
         shutil.rmtree(info["tmpdir"], ignore_errors=True)
 
 
-# --- BATCH RUNNER: download parallel + upload order me ---
+# --- BATCH RUNNER: PIPELINE (download + upload ek saath, order me) ---
+# Producer: PARALLEL_TASKS downloads ek saath chalte hain (tez).
+# Consumer: upload hamesha original order me, ek-ek karke, jaise hi koi file
+# download ho jaye. Dono ek saath chalte hain - na download upload ka wait
+# karta hai, na upload download ka. Har file complete hote hi milti hai,
+# disk par sirf kuch files rehti hain, aur 1000 ka batch bhi smooth chalta hai.
 async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
     # Har user ka apna userbot session use hoga
     userbot = await get_userbot(owner_id)
@@ -527,66 +532,93 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
     cancel_event = asyncio.Event()
     ACTIVE_BATCHES[owner_id] = cancel_event
     stats = BatchStats(total)
-    # Ek window me itni files: download parallel, phir order me upload,
-    # taaki disk par zyada load na pade aur sequence bhi na bigde
-    WINDOW = PARALLEL_TASKS * 2
 
-    async def dl(mid):
-        async with SEMAPHORE:
-            if cancel_event.is_set():
-                return None
-            return await download_one(userbot, src_chat, mid, status_msg, stats)
+    pending = {}  # idx -> info (download ho gaya, upload baki)
+    producer_done = False
+    # Disk par itni se zyada downloaded files jama nahi hongi
+    MAX_PENDING = PARALLEL_TASKS * 2
 
-    try:
-        for w in range(0, total, WINDOW):
-            if cancel_event.is_set():
-                break
-            chunk = ids[w:w + WINDOW]
-            await safe_edit(
-                status_msg,
-                f"📦 **Batch:** `{w + 1}`-`{w + len(chunk)}` / `{total}` start ho raha hai...\n"
-                f"(`{PARALLEL_TASKS}x` parallel, order me delivery)\n⏹ Cancel: `/cancel`",
-            )
-            # gather result hamesha input ke ORDER me deta hai
-            infos = await asyncio.gather(*(dl(mid) for mid in chunk))
+    async def producer():
+        nonlocal producer_done
 
-            # Upload hamesha original order me, ek-ek karke
-            for info in infos:
+        async def dl(idx, mid):
+            # Backpressure: agar upload pichhe hai to download thoda roko
+            # (disk bachao; consumer ke idx ka download hamesha pehle shuru
+            # hota hai isliye deadlock nahi hoga)
+            while len(pending) >= MAX_PENDING and not cancel_event.is_set():
+                await asyncio.sleep(0.5)
+            async with SEMAPHORE:
                 if cancel_event.is_set():
+                    return
+                info = await download_one(userbot, src_chat, mid, status_msg, stats)
+                pending[idx] = info
+
+        try:
+            await asyncio.gather(*(dl(i, mid) for i, mid in enumerate(ids)))
+        finally:
+            producer_done = True
+
+    async def consumer():
+        idx = 0
+        peer_msg = (
+            "❌ **Channel/group nahi mila.**\n"
+            "Tumhara logged-in account is channel ka **member nahi hai**, "
+            "ya link galat hai.\n"
+            "• Usi account se channel **join** karo jisse `/login` kiya tha\n"
+            "• Link bilkul usi channel ka hona chahiye\n"
+            "Phir dobara try karo."
+        )
+        while idx < total and not cancel_event.is_set():
+            # Is idx ka download complete hone ka wait karo (order me!)
+            while idx not in pending:
+                if producer_done or cancel_event.is_set():
                     break
-                if info == "PEER_INVALID":
-                    await client.send_message(
-                        owner_id,
-                        "❌ **Channel/group nahi mila.**\n"
-                        "Tumhara logged-in account is channel ka **member nahi hai**, "
-                        "ya link galat hai.\n"
-                        "• Usi account se channel **join** karo jisse `/login` kiya tha\n"
-                        "• Link bilkul usi channel ka hona chahiye\n"
-                        "Phir dobara try karo.",
-                    )
-                    cancel_event.set()
-                    break
-                if info == "BREAK":
-                    await client.send_message(
-                        owner_id,
-                        "❌ **Error:** Userbot us private channel ka member nahi hai.",
-                    )
-                    cancel_event.set()
-                    break
-                if info == "OFFLINE" or info is None:
-                    async with stats.lock:
-                        stats.done += 1
-                        stats.fail += 1
-                    continue
-                ok_one = await upload_one(client, owner_id, status_msg, info, stats)
+                await asyncio.sleep(0.5)
+            if idx not in pending:
+                return
+            info = pending.pop(idx)
+
+            if info == "PEER_INVALID":
+                await client.send_message(owner_id, peer_msg)
+                cancel_event.set()
+                return
+            if info == "BREAK":
+                await client.send_message(
+                    owner_id,
+                    "❌ **Error:** Userbot us private channel ka member nahi hai.",
+                )
+                cancel_event.set()
+                return
+            if info == "OFFLINE" or info is None:
                 async with stats.lock:
                     stats.done += 1
-                    if ok_one:
-                        stats.ok += 1
-                    else:
-                        stats.fail += 1
+                    stats.fail += 1
+                idx += 1
+                continue
+            ok_one = await upload_one(client, owner_id, status_msg, info, stats)
+            async with stats.lock:
+                stats.done += 1
+                if ok_one:
+                    stats.ok += 1
+                else:
+                    stats.fail += 1
+            idx += 1
+
+    try:
+        await safe_edit(
+            status_msg,
+            f"📦 **Batch:** `{total}` files — pipeline mode\n"
+            f"(`{PARALLEL_TASKS}x` parallel download + order me upload, ek saath)\n"
+            f"⏹ Cancel: `/cancel`",
+        )
+        await asyncio.gather(producer(), consumer())
     finally:
         ACTIVE_BATCHES.pop(owner_id, None)
+        # Cancel/fail me bachi hui downloaded files saaf karo
+        for info in pending.values():
+            if isinstance(info, dict) and info.get("tmpdir"):
+                shutil.rmtree(info["tmpdir"], ignore_errors=True)
+        pending.clear()
 
     async with stats.lock:
         ok, fail, done = stats.ok, stats.fail, stats.done
@@ -625,7 +657,6 @@ async def start_handler(client, message):
         "┃ 📌 **Commands:**",
         "┃ • `/login`  - Apne number se login",
         "┃ • `/logout` - Logout",
-        "┃ • `/plan`   - Apna plan dekho",
         "┃ • `/batch`  - Range extraction",
         "┃ • `/cancel` - Active queue stop",
         "┃ • Direct link paste karein",
