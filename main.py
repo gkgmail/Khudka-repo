@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v23"
+VERSION = "v24"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -155,7 +155,7 @@ app = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workers=16,
+    workers=32,
 )
 
 user = None
@@ -165,7 +165,7 @@ if SESSION_STRING and len(SESSION_STRING) > 30:
         api_id=API_ID,
         api_hash=API_HASH,
         session_string=SESSION_STRING,
-        workers=16,
+        workers=32,
     )
 
 USER_STATES = {}
@@ -275,7 +275,7 @@ async def get_userbot(uid):
             api_id=API_ID,
             api_hash=API_HASH,
             session_string=sess,
-            workers=16,
+            workers=32,
         )
         try:
             await asyncio.wait_for(c.start(), timeout=20.0)
@@ -590,6 +590,18 @@ async def _send_by_file_id(client, dest, kind, file_id, caption, info, topic_id=
     else:
         return await client.send_document(
             dest, document=file_id, caption=caption, **kw)
+
+
+def _sent_file_id(sent_msg, kind):
+    """Bot ne jo message bheja, uske media ka file_id nikalo.
+    Ye file_id BOT ka apna hai — isko dobara use kar sakte hain
+    (userbot wala file_id bot use NAHI kar sakta -> MEDIA_EMPTY)."""
+    if not sent_msg:
+        return None
+    attr = {"video": "video", "audio": "audio", "photo": "photo",
+            "voice": "voice", "video_note": "video_note"}.get(kind, "document")
+    media = getattr(sent_msg, attr, None)
+    return getattr(media, "file_id", None) if media else None
 
 
 # --- GROUP TOPIC (har user ke naam ka folder) ---
@@ -956,35 +968,35 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
             else:
                 prog = {}
             if send_kind == "video":
-                await client.send_video(
+                return await client.send_video(
                     dchat, video=fp, caption=cap, thumb=th,
                     duration=info.get("duration"),
                     width=info.get("width"), height=info.get("height"),
                     **prog, **kw)
             elif send_kind == "document":
-                await client.send_document(
+                return await client.send_document(
                     dchat, document=fp, caption=cap, thumb=th, **prog, **kw)
             elif send_kind == "audio":
-                await client.send_audio(
+                return await client.send_audio(
                     dchat, audio=fp, caption=cap,
                     duration=info.get("duration"),
                     performer=info.get("performer"), title=info.get("title"),
                     **prog, **kw)
             elif send_kind == "photo":
-                await client.send_photo(dchat, photo=fp, caption=cap, **kw)
+                return await client.send_photo(dchat, photo=fp, caption=cap, **kw)
             elif send_kind == "voice":
-                await client.send_voice(
+                return await client.send_voice(
                     dchat, voice=fp, caption=cap,
                     duration=info.get("duration"), **kw)
             elif send_kind == "video_note":
-                await client.send_video_note(dchat, video_note=fp, **kw)
+                return await client.send_video_note(dchat, video_note=fp, **kw)
             else:
-                await client.send_document(
+                return await client.send_document(
                     dchat, document=fp, caption=cap, **prog, **kw)
 
         # personal delivery (progress ke saath)
         try:
-            await _do_send(dest_chat, None, True)
+            sent_msg = await _do_send(dest_chat, None, True)
         except FloodWait as e:
             await asyncio.sleep(e.value + 1)
             _clean()
@@ -994,11 +1006,22 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
             _clean()
             return False
 
-        # group topic delivery (personal ke baad) — PEHLE Bot API, phir raw fallback
+        # group topic delivery (personal ke baad)
+        # v24: personal upload se mila BOT ka file_id use karo -> group copy INSTANT
+        # (userbot wala file_id bot ke kaam ka nahi -> MEDIA_EMPTY, isliye dobara upload nahi)
         if group_id and topic_id:
-            ok = await _botapi_send_to_topic(
-                send_kind, file_path=fp, caption=cap,
-                topic_id=topic_id, info=info)
+            ok = False
+            bot_fid = _sent_file_id(sent_msg, send_kind)
+            if bot_fid:
+                ok = await _botapi_send_to_topic(
+                    send_kind, file_id=bot_fid, caption=cap,
+                    topic_id=topic_id, info=info)
+                if ok:
+                    print(f"Group copy instant (file_id) for {info.get('msg_id')}", flush=True)
+            if not ok:
+                ok = await _botapi_send_to_topic(
+                    send_kind, file_path=fp, caption=cap,
+                    topic_id=topic_id, info=info)
             if not ok:
                 try:
                     peer = await client.resolve_peer(group_id)
