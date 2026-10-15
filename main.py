@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v25"
+VERSION = "v26"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -370,6 +370,39 @@ class BatchStats:
 
 
 # --- LIVE PROGRESS TRACKER (file + batch dashboard) ---
+async def _premium_card(uid, bot_client=None):
+    """⚜️ ᴘʀᴇᴍɪᴜᴍ ᴜꜱᴇʀ ᴅᴀᴛᴀ card — plan/premium check ke liye."""
+    try:
+        _u = await bot_client.get_users(uid) if bot_client else None
+        _name = (_u.first_name if _u and _u.first_name else "User")
+    except Exception:
+        _name = "User"
+    if _is_owner(uid):
+        _tl, _ed, _et = "Lifetime 👑", "—", "—"
+    elif uid in _get_allowed():
+        _tl, _ed, _et = "Lifetime ✅", "—", "—"
+    else:
+        _rem = _sub_remaining(uid)
+        if _rem > 0:
+            _d, _h = int(_rem // 86400), int((_rem % 86400) // 3600)
+            _m = int((_rem % 3600) // 60)
+            _tl = f"{_d} ᴅᴀʏꜱ, {_h} ʜᴏᴜʀꜱ, {_m} ᴍɪɴᴜᴛᴇꜱ"
+            _exp = time.time() + _rem
+            _ed = time.strftime("%d-%m-%Y", time.localtime(_exp))
+            _et = time.strftime("%I:%M:%S %p", time.localtime(_exp))
+        else:
+            _tl, _ed, _et = "Expired ❌", "—", "—"
+    return "\n".join([
+        "⚜️ ᴘʀᴇᴍɪᴜᴍ ᴜꜱᴇʀ ᴅᴀᴛᴀ :",
+        "",
+        f"👤 ᴜꜱᴇʀ : {_name}",
+        f"⚡ ᴜꜱᴇʀ ɪᴅ : {uid}",
+        f"⏰ ᴛɪᴍᴇ ʟᴇꜰᴛ : {_tl}",
+        f"⌛️ ᴇxᴘɪʀʏ ᴅᴀᴛᴇ : {_ed}",
+        f"⏱️ ᴇxᴘɪʀʏ ᴛɪᴍᴇ : {_et}",
+    ])
+
+
 async def progress_bar(
     current, total, message, start_time, last_update, action_title,
     stats=None, uid=None, bot_client=None
@@ -418,37 +451,9 @@ async def progress_bar(
             )
         lines.append(f"📦 Batch: `{done}/{total_b}`  ✅ `{ok}`  ❌ `{fail}`")
 
-    # ⚜️ Premium user data section
+    # ⚜️ Premium user data section (helper se)
     if uid:
-        try:
-            _u = await bot_client.get_users(uid) if bot_client else None
-            _name = (_u.first_name if _u and _u.first_name else "User")
-        except Exception:
-            _name = "User"
-        if _is_owner(uid):
-            _tl, _ed, _et = "Lifetime 👑", "—", "—"
-        elif uid in _get_allowed():
-            _tl, _ed, _et = "Lifetime ✅", "—", "—"
-        else:
-            _rem = _sub_remaining(uid)
-            if _rem > 0:
-                _d, _h = int(_rem // 86400), int((_rem % 86400) // 3600)
-                _m = int((_rem % 3600) // 60)
-                _tl = f"{_d} ᴅᴀʏꜱ, {_h} ʜᴏᴜʀꜱ, {_m} ᴍɪɴᴜᴛᴇꜱ"
-                _exp = time.time() + _rem
-                _ed = time.strftime("%d-%m-%Y", time.localtime(_exp))
-                _et = time.strftime("%I:%M:%S %p", time.localtime(_exp))
-            else:
-                _tl, _ed, _et = "Expired ❌", "—", "—"
-        lines += [
-            "⚜️ ᴘʀᴇᴍɪᴜᴍ ᴜꜱᴇʀ ᴅᴀᴛᴀ :",
-            "",
-            f"👤 ᴜꜱᴇʀ : {_name}",
-            f"⚡ ᴜꜱᴇʀ ɪᴅ : {uid}",
-            f"⏰ ᴛɪᴍᴇ ʟᴇꜰᴛ : {_tl}",
-            f"⌛️ ᴇxᴘɪʀʏ ᴅᴀᴛᴇ : {_ed}",
-            f"⏱️ ᴇxᴘɪʀʏ ᴛɪᴍᴇ : {_et}",
-        ]
+        lines.append(await _premium_card(uid, bot_client))
     await safe_edit(message, "\n".join(lines))
 
 
@@ -1352,15 +1357,14 @@ async def paid_handler(client, message):
     cur = subs.get(str(target), {}).get("expiry", 0)
     subs[str(target)] = {"type": "paid", "expiry": max(now, cur) + days * 86400}
     _save_subs(subs)
-    total_days = (subs[str(target)]["expiry"] - now) / 86400
+    card = await _premium_card(target, client)
     await message.reply_text(
-        f"✅ `{target}` ko paid access mil gaya.\n"
-        f"💎 Total: `{total_days:.1f}` din (expiry tak valid)."
+        f"✅ Premium activate ho gaya!\n\n{card}"
     )
     try:
         await client.send_message(
             target,
-            f"🎉 Tumhe **{days} din** ka premium access mil gaya hai!\n"
+            f"🎉 Tumhe **{days} din** ka premium access mil gaya hai!\n\n{card}\n\n"
             "`/login` karke shuru karo.",
             parse_mode=enums.ParseMode.MARKDOWN,
         )
@@ -1370,24 +1374,15 @@ async def paid_handler(client, message):
 
 @app.on_message(filters.command("plan") & filters.private)
 async def plan_handler(client, message):
-    """User apna plan aur bacha hua time dekhe."""
+    """User apna plan premium card style me dekhe."""
     uid = message.chat.id
     if not _is_allowed(uid):
         await message.reply_text("⛔ Tumhe is bot ki permission nahi hai.")
         return
-    if _is_owner(uid):
-        plan = "👑 Owner (lifetime)"
-    elif uid in _get_allowed():
-        plan = "✅ Free (lifetime)"
-    else:
-        days = _sub_remaining(uid) / 86400
-        plan = f"💎 Paid — `{days:.1f}` din bache"
+    card = await _premium_card(uid, client)
     has_session = uid in USER_CLIENTS or str(uid) in _load_json(SESSIONS_FILE, {})
     login = "🟢 Logged in" if has_session else "🔴 Not logged in (`/login` karo)"
-    await message.reply_text(
-        f"📋 **Tumhara plan:** {plan}\n🔑 **Login:** {login}",
-        parse_mode=enums.ParseMode.MARKDOWN,
-    )
+    await message.reply_text(f"{card}\n\n🔑 {login}")
 
 
 @app.on_message(filters.command("help") & filters.private)
