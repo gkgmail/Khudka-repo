@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v24"
+VERSION = "v25"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -371,8 +371,10 @@ class BatchStats:
 
 # --- LIVE PROGRESS TRACKER (file + batch dashboard) ---
 async def progress_bar(
-    current, total, message, start_time, last_update, action_title, stats=None
+    current, total, message, start_time, last_update, action_title,
+    stats=None, uid=None, bot_client=None
 ):
+    """Premium style progress bar (screenshot wala design)."""
     now = time.time()
     if (now - last_update[0]) < PROGRESS_EVERY and current != total:
         return
@@ -381,36 +383,71 @@ async def progress_bar(
     elapsed_time = max(now - start_time, 0.001)
     speed = current / elapsed_time
     percentage = (current * 100 / total) if total > 0 else 0
-    bar = get_progress_bar(percentage)
+
+    # 🟥 Squares wala progress bar (10 blocks)
+    filled = int(percentage // 10)
+    sq_bar = ("🟥 " * filled + "⬜ " * (10 - filled)).strip()
 
     remaining_bytes = max(total - current, 0)
     time_left = round(remaining_bytes / speed) if speed > 0 else 0
 
-    # ━━━ PREMIUM CARD ━━━
+    # Message ID nikalo (action_title me "ID `123`" format me hai)
+    _mid = re.search(r"ID `(\d+)`", action_title or "")
+    mid_str = _mid.group(1) if _mid else "—"
+
+    # UPLOADING ya DOWNLOADING
+    op = "UPLOADING" if "Upload" in (action_title or "") else "DOWNLOADING"
+
+    # ━━━ SCREENSHOT WALA PREMIUM STYLE ━━━
     lines = [
-        "✦ ━━━━━━━━━━━━━━━━━ ✦",
-        "      ⚡ **VILLAN** ⚡",
-        "✦ ━━━━━━━━━━━━━━━━━ ✦",
+        op,
         "",
-        f"{action_title}",
-        f"`{bar}`  **{percentage:.0f}%**",
-        "",
-        f"🚀 `{humanbytes(speed)}/s`   💾 `{humanbytes(current)}` **/** `{humanbytes(total)}`",
-        f"⏳ `{time_formatter(time_left * 1000)}` left",
+        sq_bar,
+        "╭━━━━❰ᴘʀᴏɢʀᴇss ʙᴀʀ❱━➣",
+        f"┣⪼ 🗂️ : {humanbytes(current)} | {humanbytes(total)}",
+        f"┣⪼ ⏳️ : {percentage:.1f}%",
+        f"┣⪼ 🚀 : {humanbytes(speed)}/s",
+        f"┣⪼ ⏱️ : {time_formatter(time_left * 1000)}",
+        f"┣⪼Message ID: {mid_str}",
+        "╰━━━━━━━━━━━━━━━➣",
     ]
     if stats is not None:
         async with stats.lock:
-            done, ok, fail, total_b, bstart = (
-                stats.done, stats.ok, stats.fail, stats.total, stats.start,
+            done, ok, fail, total_b = (
+                stats.done, stats.ok, stats.fail, stats.total,
             )
-        b_pct = (done * 100 / total_b) if total_b else 0
-        avg = max(now - bstart, 0.001) / max(done, 1)
-        eta_b = avg * max(total_b - done, 0)
+        lines.append(f"📦 Batch: `{done}/{total_b}`  ✅ `{ok}`  ❌ `{fail}`")
+
+    # ⚜️ Premium user data section
+    if uid:
+        try:
+            _u = await bot_client.get_users(uid) if bot_client else None
+            _name = (_u.first_name if _u and _u.first_name else "User")
+        except Exception:
+            _name = "User"
+        if _is_owner(uid):
+            _tl, _ed, _et = "Lifetime 👑", "—", "—"
+        elif uid in _get_allowed():
+            _tl, _ed, _et = "Lifetime ✅", "—", "—"
+        else:
+            _rem = _sub_remaining(uid)
+            if _rem > 0:
+                _d, _h = int(_rem // 86400), int((_rem % 86400) // 3600)
+                _m = int((_rem % 3600) // 60)
+                _tl = f"{_d} ᴅᴀʏꜱ, {_h} ʜᴏᴜʀꜱ, {_m} ᴍɪɴᴜᴛᴇꜱ"
+                _exp = time.time() + _rem
+                _ed = time.strftime("%d-%m-%Y", time.localtime(_exp))
+                _et = time.strftime("%I:%M:%S %p", time.localtime(_exp))
+            else:
+                _tl, _ed, _et = "Expired ❌", "—", "—"
         lines += [
+            "⚜️ ᴘʀᴇᴍɪᴜᴍ ᴜꜱᴇʀ ᴅᴀᴛᴀ :",
             "",
-            "━━━━━━━━━━━━━━━━━━━",
-            f"📦 `{done}`**/**`{total_b}`  (`{b_pct:.0f}%`)   ✅ `{ok}`   ❌ `{fail}`",
-            f"⏳ Batch ETA `~{time_formatter(eta_b * 1000)}`",
+            f"👤 ᴜꜱᴇʀ : {_name}",
+            f"⚡ ᴜꜱᴇʀ ɪᴅ : {uid}",
+            f"⏰ ᴛɪᴍᴇ ʟᴇꜰᴛ : {_tl}",
+            f"⌛️ ᴇxᴘɪʀʏ ᴅᴀᴛᴇ : {_ed}",
+            f"⏱️ ᴇxᴘɪʀʏ ᴛɪᴍᴇ : {_et}",
         ]
     await safe_edit(message, "\n".join(lines))
 
@@ -513,7 +550,7 @@ async def fetch_one(user_client, src_chat, msg_id):
         return None
 
 
-async def download_file(user_client, info, status_msg, stats=None):
+async def download_file(user_client, info, status_msg, stats=None, uid=None, bot_client=None):
     """Slow path: file ko disk par download karo (settings ya file_id fail par)."""
     target_msg = info.get("target_msg")
     msg_id = info["msg_id"]
@@ -531,7 +568,7 @@ async def download_file(user_client, info, status_msg, stats=None):
             progress=progress_bar,
             progress_args=(
                 status_msg, start_time, last_update,
-                f"📥 Downloading • ID `{msg_id}`", stats,
+                f"📥 Downloading • ID `{msg_id}`", stats, uid, bot_client,
             ),
         )
         if not file_path or not os.path.exists(file_path):
@@ -916,7 +953,7 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
                       flush=True)
 
         # === SLOW PATH: download + settings + upload ===
-        fp = await download_file(userbot, info, status_msg, stats)
+        fp = await download_file(userbot, info, status_msg, stats, uid, client)
         if not fp:
             _clean()
             return False
@@ -964,7 +1001,7 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
                 pa = (status_msg, start_time, last_update)
                 title = f"🚀 Uploading • ID `{info.get('msg_id')}`"
                 prog = {"progress": progress_bar,
-                        "progress_args": pa + (title, stats)}
+                        "progress_args": pa + (title, stats, uid, client)}
             else:
                 prog = {}
             if send_kind == "video":
