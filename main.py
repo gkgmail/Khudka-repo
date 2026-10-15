@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v21"
+VERSION = "v22"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -762,6 +762,27 @@ async def _find_topic_id(client, channel, title):
     return None
 
 
+async def _botapi_create_topic(title):
+    """Bot API se forum topic banao. Returns topic_id ya None.
+    (Bots MTProto se nahi, lekin Bot API se topic bana SAKTE hain!)"""
+    if not BOT_TOKEN or not LOG_GROUP_ID:
+        return None
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/createForumTopic"
+        data = {"chat_id": str(LOG_GROUP_ID), "name": title}
+        async with _aiohttp.ClientSession() as sess:
+            async with sess.post(url, data=data, timeout=30) as resp:
+                result = await resp.json()
+        if result.get("ok"):
+            tid = result["result"].get("message_thread_id")
+            print(f"[TOPIC] Bot API se topic banaya: {tid}", flush=True)
+            return tid
+        print(f"[TOPIC] createForumTopic failed: {result}", flush=True)
+    except Exception as e:
+        print(f"[TOPIC] createForumTopic exception: {e}", flush=True)
+    return None
+
+
 async def get_or_create_topic(userbot, uid):
     """LOG_GROUP me user ke naam ka forum topic (folder). Ek baar banega,
     phir wahi reuse hoga.
@@ -771,38 +792,30 @@ async def get_or_create_topic(userbot, uid):
     print(f"[TOPIC] Called for uid={uid}, LOG_GROUP_ID={LOG_GROUP_ID}", flush=True)
     if not LOG_GROUP_ID:
         return None
-    if not userbot:
-        print(f"[TOPIC] userbot nahi hai, topic nahi ban sakta", flush=True)
-        return None
-    client = userbot  # Topic management userbot se (bot se nahi!)
+    # Pehle stored topic ID check karo
+    topics = _load_json(TOPICS_FILE, {})
+    stored = topics.get(str(uid))
+    if stored:
+        print(f"[TOPIC] Stored topic_id mil gaya: {stored}", flush=True)
+        return stored
+    # Naya topic Bot API se banao (bot MTProto se nahi bana sakta!)
+    # Title ke liye user ka naam lao (bot client se, userbot se nahi)
+    title = f"User • {uid}"
     try:
-        u = await client.get_users(uid)
+        # Bot client global 'app' se user info lao
+        u = await app.get_users(uid)
         title = f"{(u.first_name or 'User')[:25]} • {uid}"
     except Exception:
-        title = f"User • {uid}"
-    try:
-        from pyrogram import raw
-        import random as _rand
-        peer = await client.resolve_peer(LOG_GROUP_ID)
-        channel = raw.types.InputChannel(
-            channel_id=peer.channel_id, access_hash=peer.access_hash)
-        # Topic dhoondo ya banao
-        topic_id = await _find_topic_id(client, channel, title)
-        if not topic_id:
-            await client.invoke(raw.functions.channels.CreateForumTopic(
-                channel=channel, title=title,
-                random_id=_rand.randint(1, 2**63 - 1)))
-            await asyncio.sleep(1)
-            topic_id = await _find_topic_id(client, channel, title)
-        if topic_id:
-            topics = _load_json(TOPICS_FILE, {})
-            topics[str(uid)] = topic_id
-            _save_json(TOPICS_FILE, topics)
-            print(f"Topic ready for {uid}: topic={topic_id}", flush=True)
-            return topic_id
-    except Exception as e:
-        print(f"Topic setup failed: {e}", flush=True)
-    return _load_json(TOPICS_FILE, {}).get(str(uid))
+        pass
+    print(f"[TOPIC] Naya topic bana raha hun: '{title}'", flush=True)
+    topic_id = await _botapi_create_topic(title)
+    if topic_id:
+        topics[str(uid)] = topic_id
+        _save_json(TOPICS_FILE, topics)
+        print(f"[TOPIC] ✅ SUCCESS: topic={topic_id} for uid={uid}", flush=True)
+        return topic_id
+    print(f"[TOPIC] ❌ FAILED: topic nahi ban saka", flush=True)
+    return None
 
 
 # --- PHASE 2: UPLOAD (hamesha ORDER me, ek-ek karke) ---
