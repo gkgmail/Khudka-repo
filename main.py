@@ -22,6 +22,13 @@ from pyrogram.errors import (
     PeerIdInvalid,
 )
 
+# --- PYROGRAM PATCH: naye bade channel/group IDs ---
+# Telegram ab 2^31 se bade channel/group IDs de raha hai (jaise 3329634673).
+# Pyrogram 2.0.106 ke utils me purana MIN_CHANNEL_ID (-1002147483647) inhe
+# "Peer id invalid" (ValueError) bolke reject kar deta hai. Isliye range fix:
+import pyrogram.utils as _pyro_utils
+_pyro_utils.MIN_CHANNEL_ID = -100999999999999
+
 # Pyrogram ka Client module-level par event loop capture kar leta hai,
 # isliye Client banane SE PEHLE ek current loop set karna zaroori hai.
 # (uvloop yahan crash karta hai, isliye default asyncio loop hi use karo)
@@ -35,7 +42,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v8"
+VERSION = "v9"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -327,16 +334,21 @@ def parse_tg_link(link: str):
 
 # --- PHASE 1: DOWNLOAD (parallel, tez) ---
 async def _fetch_with_warmup(user_client, src_chat, msg_id):
-    """get_messages karo. 'Peer id invalid' aaye to dialogs sync karke
-    peer cache warm karo aur ek baar retry karo (fresh login me hota hai)."""
+    """get_messages karo. Peer resolve na ho ('Peer id invalid') to dialogs
+    sync karke peer cache warm karo aur ek baar retry karo."""
     try:
         return await user_client.get_messages(src_chat, msg_id)
     except PeerIdInvalid:
-        try:
-            await user_client.get_dialogs(limit=500)
-        except Exception as e:
-            print(f"dialog warmup failed: {e}", flush=True)
-        return await user_client.get_messages(src_chat, msg_id)
+        pass
+    except ValueError as e:
+        # Purana Pyrogram naye bade channel IDs par ValueError deta hai
+        if "Peer id invalid" not in str(e):
+            raise
+    try:
+        await user_client.get_dialogs(limit=500)
+    except Exception as e:
+        print(f"dialog warmup failed: {e}", flush=True)
+    return await user_client.get_messages(src_chat, msg_id)
 
 
 async def download_one(user_client, src_chat, msg_id, status_msg, stats=None):
@@ -418,6 +430,11 @@ async def download_one(user_client, src_chat, msg_id, status_msg, stats=None):
     except PeerIdInvalid:
         # Retry ke baad bhi peer nahi mila = account channel ka member nahi
         return "PEER_INVALID"
+    except ValueError as e:
+        # Naye bade channel IDs par purana Pyrogram "Peer id invalid" ValueError deta hai
+        if "Peer id invalid" in str(e):
+            return "PEER_INVALID"
+        raise
     except (ChannelPrivate, ChatAdminRequired, UserNotParticipant):
         return "BREAK"
     except FloodWait as e:
