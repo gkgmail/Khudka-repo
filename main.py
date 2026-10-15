@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v19"
+VERSION = "v20"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -767,6 +767,7 @@ async def get_or_create_topic(client, uid):
     phir wahi reuse hoga.
     Returns: topic ID (raw API me top_msg_id ke liye).
     Fail par None."""
+    print(f"[TOPIC] Called for uid={uid}, LOG_GROUP_ID={LOG_GROUP_ID}", flush=True)
     if not LOG_GROUP_ID:
         return None
     try:
