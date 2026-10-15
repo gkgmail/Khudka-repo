@@ -42,7 +42,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v10"
+VERSION = "v11"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -51,8 +51,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 SESSION_STRING = os.environ.get("SESSION_STRING", "").strip()
 PORT = int(os.environ.get("PORT", 8080))
 
-# SPEED: ek saath kitni files DOWNLOAD hongi (2-5 best rehta hai)
-# NOTE: upload hamesha ORDER me ek-ek karke hoga, taaki sequence na bigde
+# (Sequential mode me istemal nahi hota; rakha hai taaki purana env var tootey nahi)
 PARALLEL_TASKS = max(1, int(os.environ.get("PARALLEL_TASKS", "3")))
 # Progress card kitne second me update ho
 PROGRESS_EVERY = float(os.environ.get("PROGRESS_EVERY", "5"))
@@ -84,7 +83,6 @@ if SESSION_STRING and len(SESSION_STRING) > 30:
         workers=16,
     )
 
-SEMAPHORE = asyncio.Semaphore(PARALLEL_TASKS)
 USER_STATES = {}
 ACTIVE_BATCHES = {}  # user_id -> asyncio.Event (cancel flag)
 LOGIN_STATES = {}  # user_id -> {"step", "phone", "phone_code_hash", "tmp"}
@@ -510,12 +508,10 @@ async def upload_one(client, dest_chat, status_msg, info, stats=None):
         shutil.rmtree(info["tmpdir"], ignore_errors=True)
 
 
-# --- BATCH RUNNER: PIPELINE (download + upload ek saath, order me) ---
-# Producer: PARALLEL_TASKS downloads ek saath chalte hain (tez).
-# Consumer: upload hamesha original order me, ek-ek karke, jaise hi koi file
-# download ho jaye. Dono ek saath chalte hain - na download upload ka wait
-# karta hai, na upload download ka. Har file complete hote hi milti hai,
-# disk par sirf kuch files rehti hain, aur 1000 ka batch bhi smooth chalta hai.
+# --- BATCH RUNNER: SEQUENTIAL (ek download -> upload -> next) ---
+# Har file: pehle download karo, turant upload karo, complete.
+# Phir agli file. Koi parallel nahi - har file ko poori bandwidth milti hai
+# aur files ek-ek karke order me milti hain. Disk par 1 se zyada file nahi.
 async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
     # Har user ka apna userbot session use hoga
     userbot = await get_userbot(owner_id)
@@ -532,69 +528,51 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
     cancel_event = asyncio.Event()
     ACTIVE_BATCHES[owner_id] = cancel_event
     stats = BatchStats(total)
+    peer_msg = (
+        "❌ **Channel/group nahi mila.**\n"
+        "Tumhara logged-in account is channel ka **member nahi hai**, "
+        "ya link galat hai.\n"
+        "• Usi account se channel **join** karo jisse `/login` kiya tha\n"
+        "• Link bilkul usi channel ka hona chahiye\n"
+        "Phir dobara try karo."
+    )
 
-    pending = {}  # idx -> info (download ho gaya, upload baki)
-    producer_done = False
-    # Disk par itni se zyada downloaded files jama nahi hongi
-    MAX_PENDING = PARALLEL_TASKS * 2
+    def _clean(info):
+        if isinstance(info, dict) and info.get("tmpdir"):
+            shutil.rmtree(info["tmpdir"], ignore_errors=True)
 
-    async def producer():
-        nonlocal producer_done
-
-        async def dl(idx, mid):
-            # Backpressure: agar upload pichhe hai to download thoda roko
-            # (disk bachao; consumer ke idx ka download hamesha pehle shuru
-            # hota hai isliye deadlock nahi hoga)
-            while len(pending) >= MAX_PENDING and not cancel_event.is_set():
-                await asyncio.sleep(0.5)
-            async with SEMAPHORE:
-                if cancel_event.is_set():
-                    return
-                info = await download_one(userbot, src_chat, mid, status_msg, stats)
-                pending[idx] = info
-
-        try:
-            await asyncio.gather(*(dl(i, mid) for i, mid in enumerate(ids)))
-        finally:
-            producer_done = True
-
-    async def consumer():
-        idx = 0
-        peer_msg = (
-            "❌ **Channel/group nahi mila.**\n"
-            "Tumhara logged-in account is channel ka **member nahi hai**, "
-            "ya link galat hai.\n"
-            "• Usi account se channel **join** karo jisse `/login` kiya tha\n"
-            "• Link bilkul usi channel ka hona chahiye\n"
-            "Phir dobara try karo."
+    try:
+        await safe_edit(
+            status_msg,
+            f"📦 **Batch:** `{total}` files — ek-ek karke\n"
+            f"(1 download → upload → next)\n"
+            f"⏹ Cancel: `/cancel`",
         )
-        while idx < total and not cancel_event.is_set():
-            # Is idx ka download complete hone ka wait karo (order me!)
-            while idx not in pending:
-                if producer_done or cancel_event.is_set():
-                    break
-                await asyncio.sleep(0.5)
-            if idx not in pending:
-                return
-            info = pending.pop(idx)
-
+        for mid in ids:
+            if cancel_event.is_set():
+                break
+            # STEP 1: ek file download karo
+            info = await download_one(userbot, src_chat, mid, status_msg, stats)
+            if cancel_event.is_set():
+                _clean(info)
+                break
             if info == "PEER_INVALID":
                 await client.send_message(owner_id, peer_msg)
                 cancel_event.set()
-                return
+                break
             if info == "BREAK":
                 await client.send_message(
                     owner_id,
                     "❌ **Error:** Userbot us private channel ka member nahi hai.",
                 )
                 cancel_event.set()
-                return
+                break
             if info == "OFFLINE" or info is None:
                 async with stats.lock:
                     stats.done += 1
                     stats.fail += 1
-                idx += 1
                 continue
+            # STEP 2: turant upload karo, phir agli file
             ok_one = await upload_one(client, owner_id, status_msg, info, stats)
             async with stats.lock:
                 stats.done += 1
@@ -602,23 +580,8 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
                     stats.ok += 1
                 else:
                     stats.fail += 1
-            idx += 1
-
-    try:
-        await safe_edit(
-            status_msg,
-            f"📦 **Batch:** `{total}` files — pipeline mode\n"
-            f"(`{PARALLEL_TASKS}x` parallel download + order me upload, ek saath)\n"
-            f"⏹ Cancel: `/cancel`",
-        )
-        await asyncio.gather(producer(), consumer())
     finally:
         ACTIVE_BATCHES.pop(owner_id, None)
-        # Cancel/fail me bachi hui downloaded files saaf karo
-        for info in pending.values():
-            if isinstance(info, dict) and info.get("tmpdir"):
-                shutil.rmtree(info["tmpdir"], ignore_errors=True)
-        pending.clear()
 
     async with stats.lock:
         ok, fail, done = stats.ok, stats.fail, stats.done
@@ -651,12 +614,13 @@ async def start_handler(client, message):
         "┃ ",
         f"┃ 🔑 **Login:** `{user_status}`",
         f"┃ 🛡️ **Access:** `{access}`",
-        f"┃ 🚀 **Parallel Download:** `{PARALLEL_TASKS}x`",
+        "┃ 🚀 **Mode:** `Ek-ek karke`",
         "┃ 📑 **Delivery:** `Order me`",
         "┃ ",
         "┃ 📌 **Commands:**",
         "┃ • `/login`  - Apne number se login",
         "┃ • `/logout` - Logout",
+        "┃ • `/plan`   - Apna plan dekho",
         "┃ • `/batch`  - Range extraction",
         "┃ • `/cancel` - Active queue stop",
         "┃ • Direct link paste karein",
@@ -1102,8 +1066,7 @@ async def message_dispatcher(client, message):
             return
 
         status_msg = await message.reply_text(
-            f"🦅 **Batch Started!** `{total_files}` items queued "
-            f"(`{PARALLEL_TASKS}x` parallel download, order me delivery)."
+            f"🦅 **Batch Started!** `{total_files}` items queued (ek-ek karke)."
         )
         await run_batch(client, user_id, chat_id, start_id, end_id, status_msg)
         return
@@ -1126,7 +1089,7 @@ async def message_dispatcher(client, message):
             return
 
         status_msg = await message.reply_text(
-            f"⏳ `{total}` item(s) processing (`{PARALLEL_TASKS}x` parallel download, order me delivery)..."
+            f"⏳ `{total}` item(s) processing (ek-ek karke)..."
         )
         await run_batch(client, user_id, chat_id, start_id, end_id, status_msg)
 
@@ -1142,7 +1105,7 @@ async def main():
     print("========================================", flush=True)
     print(f"👉 BOT LISTENING AS: @{me.username}", flush=True)
     print(f"👉 VERSION: {VERSION}", flush=True)
-    print(f"👉 PARALLEL DOWNLOADS: {PARALLEL_TASKS}x (upload order me)", flush=True)
+    print("👉 MODE: sequential (ek download → upload → next)", flush=True)
     print(f"👉 OWNER_ID: {OWNER_ID if OWNER_ID else 'not set (open mode)'}", flush=True)
     print("========================================", flush=True)
 
