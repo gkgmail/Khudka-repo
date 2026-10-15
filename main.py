@@ -14,13 +14,11 @@ from pyrogram.errors import (
     UserNotParticipant,
 )
 
-# uvloop: Linux par tez event loop. Install na ho to normal loop chalega.
-try:
-    import uvloop
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    print("⚡ uvloop enabled", flush=True)
-except ImportError:
-    print("ℹ️ uvloop nahi mila, default loop use ho raha hai", flush=True)
+# Pyrogram ka Client module-level par event loop capture kar leta hai,
+# isliye Client banane SE PEHLE ek current loop set karna zaroori hai.
+# (uvloop yahan crash karta hai, isliye default asyncio loop hi use karo)
+_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(_loop)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -581,4 +579,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # NOTE: asyncio.run() NAYA loop banata hai, jabki Client ne upar wala
+    # loop capture kar rakha hai. app.run() current (wahi) loop use karta
+    # hai, tabhi handlers aur updates sahi chalenge.
+    app.run(main())
