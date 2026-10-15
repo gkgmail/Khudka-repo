@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v18"
+VERSION = "v19"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -591,7 +591,87 @@ async def _send_by_file_id(client, dest, kind, file_id, caption, info, topic_id=
 
 
 # --- GROUP TOPIC (har user ke naam ka folder) ---
-# --- GROUP TOPIC: raw API se bhejo (top_msg_id) ---
+# --- GROUP TOPIC: Bot API se bhejo (message_thread_id) ---
+# MTProto raw API me top_msg_id kaam nahi kar raha, isliye Bot API ka
+# message_thread_id use karenge — ye forum topics ke liye GUARANTEED kaam karta hai.
+import aiohttp as _aiohttp
+
+async def _botapi_send_to_topic(kind, file_id=None, file_path=None,
+                                caption="", topic_id=None, info=None):
+    """Bot API HTTP se topic me bhejo. file_id ho to instant, warna upload.
+    Returns True/False."""
+    if not BOT_TOKEN or not LOG_GROUP_ID or not topic_id:
+        return False
+    info = info or {}
+    try:
+        method_map = {
+            "video": "sendVideo", "audio": "sendAudio", "photo": "sendPhoto",
+            "voice": "sendVoice", "video_note": "sendVideoNote",
+            "document": "sendDocument", "text": "sendMessage",
+        }
+        method = method_map.get(kind, "sendDocument")
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+        data = {
+            "chat_id": str(LOG_GROUP_ID),
+            "message_thread_id": str(topic_id),
+            "caption": caption or "",
+        }
+        files = None
+        if kind == "text":
+            data = {
+                "chat_id": str(LOG_GROUP_ID),
+                "message_thread_id": str(topic_id),
+                "text": caption or "",
+            }
+        elif file_id:
+            # file_id se instant bhejo
+            param = {"video": "video", "audio": "audio", "photo": "photo",
+                     "voice": "voice", "video_note": "video_note"}.get(kind, "document")
+            data[param] = file_id
+            if kind == "video":
+                if info.get("duration"):
+                    data["duration"] = str(info["duration"])
+                if info.get("width"):
+                    data["width"] = str(info["width"])
+                if info.get("height"):
+                    data["height"] = str(info["height"])
+            elif kind in ("audio", "voice"):
+                if info.get("duration"):
+                    data["duration"] = str(info["duration"])
+        elif file_path and os.path.exists(file_path):
+            # file upload karo (50MB tak Bot API limit)
+            size = os.path.getsize(file_path)
+            if size > 50 * 1024 * 1024:
+                print(f"Bot API: file too big ({size}), skipping", flush=True)
+                return False
+            param = {"video": "video", "audio": "audio", "photo": "photo",
+                     "voice": "voice", "video_note": "video_note"}.get(kind, "document")
+            files = {param: open(file_path, "rb")}
+        else:
+            return False
+        async with _aiohttp.ClientSession() as sess:
+            if files:
+                form = _aiohttp.FormData()
+                for k, v in data.items():
+                    form.add_field(k, v)
+                for k, f in files.items():
+                    form.add_field(k, f, filename=os.path.basename(file_path))
+                    f.close()
+                async with sess.post(url, data=form, timeout=300) as resp:
+                    result = await resp.json()
+            else:
+                async with sess.post(url, data=data, timeout=60) as resp:
+                    result = await resp.json()
+        if result.get("ok"):
+            return True
+        print(f"Bot API failed: {result}", flush=True)
+        return False
+    except Exception as e:
+        print(f"Bot API send failed: {e}", flush=True)
+        return False
+
+
+# --- GROUP TOPIC: raw API se bhejo (top_msg_id) [FALLBACK] ---
 # Pyrogram 2.0.106 ke high-level send_* me top_msg_id nahi hai, isliye
 # forum topic me bhejne ke liye raw messages.SendMedia use karna padta hai.
 async def _raw_send_to_topic(client, peer, topic_id, kind, file_id=None,
@@ -775,15 +855,21 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
             try:
                 await _send_by_file_id(client, dest_chat, kind, file_id, cap, info)
                 if group_id and topic_id:
-                    try:
-                        peer = await client.resolve_peer(group_id)
-                        ok = await _raw_send_to_topic(
-                            client, peer, topic_id, kind,
-                            file_id=file_id, caption=cap, info=info)
-                        if not ok:
-                            print(f"Group topic send failed, skipping", flush=True)
-                    except Exception as e:
-                        print(f"Group file_id send failed: {e}", flush=True)
+                    # PEHLE Bot API try karo (message_thread_id guaranteed kaam karta hai)
+                    ok = await _botapi_send_to_topic(
+                        kind, file_id=file_id, caption=cap,
+                        topic_id=topic_id, info=info)
+                    if not ok:
+                        # Fallback: raw MTProto
+                        try:
+                            peer = await client.resolve_peer(group_id)
+                            ok = await _raw_send_to_topic(
+                                client, peer, topic_id, kind,
+                                file_id=file_id, caption=cap, info=info)
+                            if not ok:
+                                print(f"Group topic send failed, skipping", flush=True)
+                        except Exception as e:
+                            print(f"Group file_id send failed: {e}", flush=True)
                 elif group_id:
                     # topic nahi bana to General me bhejo (fallback)
                     try:
@@ -887,18 +973,22 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
             _clean()
             return False
 
-        # group topic delivery (personal ke baad) — raw API, top_msg_id se
+        # group topic delivery (personal ke baad) — PEHLE Bot API, phir raw fallback
         if group_id and topic_id:
-            try:
-                peer = await client.resolve_peer(group_id)
-                ok = await _raw_send_to_topic(
-                    client, peer, topic_id, send_kind,
-                    file_path=fp, caption=cap, info=info, thumb=th)
-                if not ok:
-                    print(f"Group topic upload failed, trying fallback", flush=True)
-                    await _do_send(group_id, None, False)
-            except Exception as e:
-                print(f"Group upload failed: {e}", flush=True)
+            ok = await _botapi_send_to_topic(
+                send_kind, file_path=fp, caption=cap,
+                topic_id=topic_id, info=info)
+            if not ok:
+                try:
+                    peer = await client.resolve_peer(group_id)
+                    ok = await _raw_send_to_topic(
+                        client, peer, topic_id, send_kind,
+                        file_path=fp, caption=cap, info=info, thumb=th)
+                    if not ok:
+                        print(f"Group topic upload failed, trying fallback", flush=True)
+                        await _do_send(group_id, None, False)
+                except Exception as e:
+                    print(f"Group upload failed: {e}", flush=True)
         elif group_id:
             try:
                 await _do_send(group_id, None, False)
