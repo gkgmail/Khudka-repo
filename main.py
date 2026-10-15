@@ -1,10 +1,12 @@
 import os
 import re
 import time
+import shutil
 import logging
 import asyncio
+import tempfile
 from aiohttp import web
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters, idle, enums
 from pyrogram.errors import (
     FloodWait,
     ChannelPrivate,
@@ -12,7 +14,14 @@ from pyrogram.errors import (
     UserNotParticipant,
 )
 
-# Pyrogram ka internal network logger enable karein
+# uvloop: Linux par tez event loop. Install na ho to normal loop chalega.
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    print("⚡ uvloop enabled", flush=True)
+except ImportError:
+    print("ℹ️ uvloop nahi mila, default loop use ho raha hai", flush=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -26,13 +35,19 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 SESSION_STRING = os.environ.get("SESSION_STRING", "").strip()
 PORT = int(os.environ.get("PORT", 8080))
 
+# SPEED: ek saath kitni files DOWNLOAD hongi (2-5 best rehta hai)
+# NOTE: upload hamesha ORDER me ek-ek karke hoga, taaki sequence na bigde
+PARALLEL_TASKS = max(1, int(os.environ.get("PARALLEL_TASKS", "3")))
+# Progress card kitne second me update ho
+PROGRESS_EVERY = float(os.environ.get("PROGRESS_EVERY", "5"))
+
 # Pyrogram Clients Setup
 app = Client(
     "bot_service",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workers=8,
+    workers=16,
 )
 
 user = None
@@ -42,11 +57,12 @@ if SESSION_STRING and len(SESSION_STRING) > 30:
         api_id=API_ID,
         api_hash=API_HASH,
         session_string=SESSION_STRING,
-        workers=8,
+        workers=16,
     )
 
-SEMAPHORE = asyncio.Semaphore(2)
+SEMAPHORE = asyncio.Semaphore(PARALLEL_TASKS)
 USER_STATES = {}
+ACTIVE_BATCHES = {}  # user_id -> asyncio.Event (cancel flag)
 USERBOT_ONLINE = False
 
 
@@ -101,12 +117,22 @@ def get_progress_bar(percentage):
     return "▰" * completed + "▱" * remaining
 
 
+async def safe_edit(msg, text):
+    """Parallel tasks me edit conflict/FloodWait aaye to silently skip."""
+    try:
+        await msg.edit_text(text, parse_mode=enums.ParseMode.MARKDOWN)
+    except FloodWait:
+        pass
+    except Exception:
+        pass
+
+
 # --- LIVE PROGRESS TRACKER ---
 async def progress_bar(
     current, total, message, start_time, last_update, action_title
 ):
     now = time.time()
-    if (now - last_update[0]) < 5.0 and current != total:
+    if (now - last_update[0]) < PROGRESS_EVERY and current != total:
         return
     last_update[0] = now
 
@@ -118,9 +144,6 @@ async def progress_bar(
     remaining_bytes = max(total - current, 0)
     time_left = round(remaining_bytes / speed) if speed > 0 else 0
 
-    eta = time_formatter(time_left * 1000)
-    elapsed = time_formatter(elapsed_time * 1000)
-
     card_lines = [
         "╭━━━━━━━━━━━━━━━━━━━━╮",
         "┃ 🦅 **VILLAN CLONER** 🦅",
@@ -130,14 +153,11 @@ async def progress_bar(
         f"┃ ⚡ **Speed:** `{humanbytes(speed)}/s`",
         f"┃ 💾 **Done:** `{humanbytes(current)} / {humanbytes(total)}`",
         f"┃ 📦 **Left:** `{humanbytes(remaining_bytes)}`",
-        f"┃ ⏳ **ETA:** `{eta}`",
-        f"┃ ⏱️ **Elapsed:** `{elapsed}`",
+        f"┃ ⏳ **ETA:** `{time_formatter(time_left * 1000)}`",
+        f"┃ ⏱️ **Elapsed:** `{time_formatter(elapsed_time * 1000)}`",
         "╰━━━━━━━━━━━━━━━━━━━━╯",
     ]
-    try:
-        await message.edit_text("\n".join(card_lines))
-    except Exception:
-        pass
+    await safe_edit(message, "\n".join(card_lines))
 
 
 def parse_tg_link(link: str):
@@ -150,143 +170,229 @@ def parse_tg_link(link: str):
     return chat_id, message_id
 
 
-# --- MESSAGE PROCESSING ENGINE ---
-async def process_single_message(
-    client, user_client, target_chat, msg_id, status_msg, chat_id
-):
+# --- PHASE 1: DOWNLOAD (parallel, tez) ---
+async def download_one(user_client, src_chat, msg_id, status_msg):
+    """Ek message userbot se download karo.
+    Returns: info dict | None (skip) | 'BREAK' (fatal) | 'OFFLINE'."""
     if not USERBOT_ONLINE or not user_client:
-        await client.send_message(
-            chat_id,
-            "❌ **Userbot session offline hai!** Koyeb environment me `SESSION_STRING` check karein.",
-        )
-        return "BREAK"
+        return "OFFLINE"
 
-    file_path = None
-    thumb_path = None
+    tmpdir = tempfile.mkdtemp(prefix=f"vln_{msg_id}_")
     try:
-        target_msg = await user_client.get_messages(target_chat, msg_id)
+        target_msg = await user_client.get_messages(src_chat, msg_id)
         if not target_msg or target_msg.empty:
-            return False
+            return None
 
         if not target_msg.media:
             if target_msg.text:
-                await client.send_message(chat_id, target_msg.text)
-                return True
-            return False
+                return {"kind": "text", "text": target_msg.text,
+                        "tmpdir": tmpdir, "msg_id": msg_id}
+            return None
 
         media_obj = getattr(target_msg, target_msg.media.value)
         file_size = getattr(media_obj, "file_size", 0)
         if file_size > 2097152000:
-            await client.send_message(
-                chat_id, f"⚠️ **Message {msg_id}:** File 2GB se badi hai."
-            )
-            return False
+            return {"kind": "too_big", "msg_id": msg_id, "tmpdir": tmpdir}
+
+        orig_name = os.path.basename(
+            getattr(media_obj, "file_name", "") or f"media_{msg_id}"
+        )
+        dl_path = os.path.join(tmpdir, orig_name)
 
         last_update = [time.time()]
         start_time = time.time()
         file_path = await user_client.download_media(
             target_msg,
+            file_name=dl_path,
             progress=progress_bar,
             progress_args=(
-                status_msg,
-                start_time,
-                last_update,
-                "📥 Downloading...",
+                status_msg, start_time, last_update, "📥 Downloading...",
             ),
         )
+        if not file_path or not os.path.exists(file_path):
+            return None
 
+        thumb_path = None
         if target_msg.video and target_msg.video.thumbs:
             try:
                 thumb_path = await user_client.download_media(
-                    target_msg.video.thumbs[0].file_id
+                    target_msg.video.thumbs[0].file_id,
+                    file_name=os.path.join(tmpdir, "thumb.jpg"),
                 )
             except Exception:
                 thumb_path = None
 
-        caption = target_msg.caption or ""
-        last_update = [time.time()]
-        start_time = time.time()
-
+        info = {
+            "kind": target_msg.media.value,
+            "tmpdir": tmpdir,
+            "file_path": file_path,
+            "thumb_path": thumb_path,
+            "caption": target_msg.caption or "",
+            "msg_id": msg_id,
+        }
         if target_msg.video:
-            await client.send_video(
-                chat_id,
-                video=file_path,
-                caption=caption,
-                thumb=thumb_path,
-                duration=target_msg.video.duration,
-                width=target_msg.video.width,
-                height=target_msg.video.height,
-                progress=progress_bar,
-                progress_args=(
-                    status_msg,
-                    start_time,
-                    last_update,
-                    "🚀 Uploading Video...",
-                ),
-            )
-        elif target_msg.document:
-            await client.send_document(
-                chat_id,
-                document=file_path,
-                caption=caption,
-                thumb=thumb_path,
-                progress=progress_bar,
-                progress_args=(
-                    status_msg,
-                    start_time,
-                    last_update,
-                    "🚀 Uploading Document...",
-                ),
-            )
-        elif target_msg.audio:
-            await client.send_audio(
-                chat_id,
-                audio=file_path,
-                caption=caption,
-                duration=target_msg.audio.duration,
-                performer=target_msg.audio.performer,
-                title=target_msg.audio.title,
-                progress=progress_bar,
-                progress_args=(
-                    status_msg,
-                    start_time,
-                    last_update,
-                    "🚀 Uploading Audio...",
-                ),
-            )
-        elif target_msg.photo:
-            await client.send_photo(chat_id, photo=file_path, caption=caption)
-
-        return True
+            info.update({
+                "duration": target_msg.video.duration,
+                "width": target_msg.video.width,
+                "height": target_msg.video.height,
+            })
+        if target_msg.audio:
+            info.update({
+                "duration": target_msg.audio.duration,
+                "performer": target_msg.audio.performer,
+                "title": target_msg.audio.title,
+            })
+        if target_msg.voice:
+            info.update({"duration": target_msg.voice.duration})
+        return info
 
     except (ChannelPrivate, ChatAdminRequired, UserNotParticipant):
-        await client.send_message(
-            chat_id,
-            "❌ **Error:** Userbot account is private channel ka member nahi hai.",
-        )
         return "BREAK"
     except FloodWait as e:
-        await asyncio.sleep(e.value)
+        await asyncio.sleep(e.value + 1)
+        return None
+    except Exception as e:
+        print(f"Download error on {msg_id}: {e}", flush=True)
+        return None
+
+
+# --- PHASE 2: UPLOAD (hamesha ORDER me, ek-ek karke) ---
+async def upload_one(client, dest_chat, status_msg, info):
+    kind = info["kind"]
+    try:
+        if kind == "text":
+            await client.send_message(dest_chat, info["text"])
+            return True
+        if kind == "too_big":
+            await client.send_message(
+                dest_chat,
+                f"⚠️ **Message {info['msg_id']}:** File 2GB se badi hai.",
+            )
+            return False
+
+        fp, cap, th = info["file_path"], info["caption"], info.get("thumb_path")
+        last_update = [time.time()]
+        start_time = time.time()
+        pa = (status_msg, start_time, last_update)
+
+        if kind == "video":
+            await client.send_video(
+                dest_chat, video=fp, caption=cap, thumb=th,
+                duration=info.get("duration"),
+                width=info.get("width"), height=info.get("height"),
+                progress=progress_bar,
+                progress_args=pa + ("🚀 Uploading Video...",),
+            )
+        elif kind == "document":
+            await client.send_document(
+                dest_chat, document=fp, caption=cap, thumb=th,
+                progress=progress_bar,
+                progress_args=pa + ("🚀 Uploading Document...",),
+            )
+        elif kind == "audio":
+            await client.send_audio(
+                dest_chat, audio=fp, caption=cap,
+                duration=info.get("duration"),
+                performer=info.get("performer"), title=info.get("title"),
+                progress=progress_bar,
+                progress_args=pa + ("🚀 Uploading Audio...",),
+            )
+        elif kind == "photo":
+            await client.send_photo(dest_chat, photo=fp, caption=cap)
+        elif kind == "voice":
+            await client.send_voice(
+                dest_chat, voice=fp, caption=cap,
+                duration=info.get("duration"),
+            )
+        elif kind == "video_note":
+            await client.send_video_note(dest_chat, video_note=fp)
+        else:
+            await client.send_document(dest_chat, document=fp, caption=cap)
+        return True
+
+    except FloodWait as e:
+        await asyncio.sleep(e.value + 1)
         return False
     except Exception as e:
-        print(f"Error on {msg_id}: {e}", flush=True)
+        print(f"Upload error on {info.get('msg_id')}: {e}", flush=True)
         return False
     finally:
-        for p in [file_path, thumb_path]:
-            if p and os.path.exists(p):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
+        shutil.rmtree(info["tmpdir"], ignore_errors=True)
 
 
-# --- GLOBAL PACKET WATCHER (Har update ko console par laayega) ---
-@app.on_message(group=-1)
-async def packet_sniffer(client, message):
-    print(
-        f"🔥 [UPDATE DETECTED] Chat ID: {message.chat.id} | Text: {message.text or '<media>'}",
-        flush=True,
-    )
+# --- BATCH RUNNER: download parallel + upload order me ---
+async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
+    if not USERBOT_ONLINE or not user:
+        await client.send_message(
+            owner_id,
+            "❌ **Userbot session offline hai!** Koyeb environment me `SESSION_STRING` check karein.",
+            parse_mode=enums.ParseMode.MARKDOWN,
+        )
+        await safe_edit(status_msg, "❌ **Userbot offline.**")
+        return
+
+    ids = list(range(start_id, end_id + 1))
+    total = len(ids)
+    cancel_event = asyncio.Event()
+    ACTIVE_BATCHES[owner_id] = cancel_event
+    ok = 0
+    fail = 0
+    # Ek window me itni files: download parallel, phir order me upload,
+    # taaki disk par zyada load na pade aur sequence bhi na bigde
+    WINDOW = PARALLEL_TASKS * 2
+
+    async def dl(mid):
+        async with SEMAPHORE:
+            if cancel_event.is_set():
+                return None
+            return await download_one(user, src_chat, mid, status_msg)
+
+    try:
+        for w in range(0, total, WINDOW):
+            if cancel_event.is_set():
+                break
+            chunk = ids[w:w + WINDOW]
+            await safe_edit(
+                status_msg,
+                f"📥 **Downloading** `{w + 1}`-`{w + len(chunk)}` / `{total}` "
+                f"(`{PARALLEL_TASKS}x` parallel)...\n⏹ Cancel: `/cancel`",
+            )
+            # gather result hamesha input ke ORDER me deta hai
+            infos = await asyncio.gather(*(dl(mid) for mid in chunk))
+
+            # Upload hamesha original order me, ek-ek karke
+            for info in infos:
+                if cancel_event.is_set():
+                    break
+                if info == "BREAK":
+                    await client.send_message(
+                        owner_id,
+                        "❌ **Error:** Userbot us private channel ka member nahi hai.",
+                    )
+                    cancel_event.set()
+                    break
+                if info == "OFFLINE" or info is None:
+                    fail += 1
+                    continue
+                done = ok + fail + 1
+                await safe_edit(
+                    status_msg,
+                    f"🚀 **Uploading** `{done}/{total}` (ID: `{info.get('msg_id')}`)...",
+                )
+                if await upload_one(client, owner_id, status_msg, info):
+                    ok += 1
+                else:
+                    fail += 1
+    finally:
+        ACTIVE_BATCHES.pop(owner_id, None)
+
+    if cancel_event.is_set() and (ok + fail < total):
+        await safe_edit(status_msg, "🛑 **Batch stopped.**")
+    else:
+        await safe_edit(
+            status_msg,
+            f"✅ **Batch complete!**\n✔️ Success: `{ok}` | ❌ Failed: `{fail}`",
+        )
 
 
 # --- BOT HANDLERS ---
@@ -305,6 +411,8 @@ async def start_handler(client, message):
         "┃ content instantly save karne ke liye ready hoon.",
         "┃ ",
         f"┃ ⚙️ **Engine Status:** `{user_status}`",
+        f"┃ 🚀 **Parallel Download:** `{PARALLEL_TASKS}x`",
+        "┃ 📑 **Delivery:** `Order me`",
         "┃ ",
         "┃ 📌 **Commands:**",
         "┃ • `/batch`  - Range extraction",
@@ -314,10 +422,11 @@ async def start_handler(client, message):
         "┃ ⚡ *Ultra-Fast Engine by VILLAN*",
         "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯",
     ]
-    card = "\n".join(start_lines)
 
     try:
-        await message.reply_text(card)
+        await message.reply_text(
+            "\n".join(start_lines), parse_mode=enums.ParseMode.MARKDOWN
+        )
     except Exception as e:
         print(f"Card error: {e}, sending plain fallback...", flush=True)
         await message.reply_text(
@@ -327,8 +436,16 @@ async def start_handler(client, message):
 
 @app.on_message(filters.command("cancel") & filters.private)
 async def cancel_handler(client, message):
-    if message.chat.id in USER_STATES:
-        del USER_STATES[message.chat.id]
+    uid = message.chat.id
+    hit = False
+    if uid in USER_STATES:
+        USER_STATES.pop(uid, None)
+        hit = True
+    ev = ACTIVE_BATCHES.get(uid)
+    if ev is not None:
+        ev.set()
+        hit = True
+    if hit:
         await message.reply_text("🛑 **VILLAN Engine:** Task cancel kar diya gaya hai.")
     else:
         await message.reply_text("Kuch bhi active nahi hai cancel karne ke liye.")
@@ -397,22 +514,10 @@ async def message_dispatcher(client, message):
             return
 
         status_msg = await message.reply_text(
-            f"🦅 **Batch Started!** `{total_files}` items queued."
+            f"🦅 **Batch Started!** `{total_files}` items queued "
+            f"(`{PARALLEL_TASKS}x` parallel download, order me delivery)."
         )
-
-        async with SEMAPHORE:
-            for idx, current_id in enumerate(range(start_id, end_id + 1), start=1):
-                await status_msg.edit_text(
-                    f"🔄 Processing `{idx}/{total_files}` (ID: `{current_id}`)..."
-                )
-                res = await process_single_message(
-                    client, user, chat_id, current_id, status_msg, user_id
-                )
-                if res == "BREAK":
-                    break
-                await asyncio.sleep(2)
-
-        await status_msg.edit_text("✅ Batch complete!")
+        await run_batch(client, user_id, chat_id, start_id, end_id, status_msg)
         return
 
     range_regex = (
@@ -428,18 +533,14 @@ async def message_dispatcher(client, message):
             start_id, end_id = end_id, start_id
 
         total = end_id - start_id + 1
-        status_msg = await message.reply_text(f"⏳ `{total}` item(s) processing...")
+        if total > 150:
+            await message.reply_text("⚠️ Max 150 posts allow hain.")
+            return
 
-        async with SEMAPHORE:
-            for idx, current_id in enumerate(range(start_id, end_id + 1), start=1):
-                res = await process_single_message(
-                    client, user, chat_id, current_id, status_msg, user_id
-                )
-                if res == "BREAK":
-                    break
-                await asyncio.sleep(2)
-
-        await status_msg.delete()
+        status_msg = await message.reply_text(
+            f"⏳ `{total}` item(s) processing (`{PARALLEL_TASKS}x` parallel download, order me delivery)..."
+        )
+        await run_batch(client, user_id, chat_id, start_id, end_id, status_msg)
 
 
 # --- BACKGROUND USERBOT CONNECT ---
@@ -468,6 +569,7 @@ async def main():
     me = await app.get_me()
     print("========================================", flush=True)
     print(f"👉 BOT LISTENING AS: @{me.username}", flush=True)
+    print(f"👉 PARALLEL DOWNLOADS: {PARALLEL_TASKS}x (upload order me)", flush=True)
     print("========================================", flush=True)
 
     asyncio.create_task(start_userbot_background())
@@ -480,4 +582,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    

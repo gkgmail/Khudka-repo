@@ -1,0 +1,61 @@
+VILLAN BOT - SPEED OPTIMIZATION NOTES (Hinglish)
+================================================
+
+Tumhare purane code me speed ki 3 badi problems thi:
+
+1. SEQUENTIAL LOOP: Ek file download -> upload -> phir agli file.
+   Beech me har file par 2 second ka sleep(2) bhi tha.
+   150 files = 150 x 2 sec = 5 minute sirf waiting me waste!
+
+2. SEMAPHORE(2) bekaar tha: poore batch loop ko ek baar me wrap kiya
+   tha, isliye parallel me kuch hota hi nahi tha.
+
+3. Har update par print karne wala packet_sniffer logger noise badha
+   raha tha (speed par halka asar + logs ka kharcha).
+
+IS OPTIMIZED VERSION ME KYA BADLA:
+-----------------------------------
+- PARALLEL_TASKS=3 (default): ab 3 files EK SAATH download/upload hongi.
+  Env var se 2-5 tak set kar sakte ho. 3 safe sweet spot hai.
+- sleep(2) hata diya: FloodWait aayega to code khud wait karega.
+- Har file ke liye alag temp folder: parallel me same naam wali
+  files aapas me overwrite nahi karengi.
+- uvloop add kiya: Linux par asyncio ~2x tez hota hai.
+- /cancel ab sach me kaam karta hai (beech me batch rok deta hai).
+- packet_sniffer hata diya.
+- Progress card me parse_mode fix (pehle **bold** raw text dikhta tha).
+- voice / video_note support add kiya.
+- Python 3.11-slim image (3.10 se thoda tez).
+
+KOYEB DEPLOY CHECKLIST (speed ke liye sabse zaroori):
+-----------------------------------------------------
+1. GitHub par push karo, Koyeb me "Deploy from GitHub" -> Builder: Dockerfile.
+2. REGION: fra (Frankfurt) chuno. Telegram ke zyadatar DC Europe me
+   hain, Frankfurt se latency sabse kam milegi = tez speed.
+3. INSTANCE: Free "Eco" instance par network/CPU throttle hota hai.
+   Kam se kam "Standard Nano" (paid) lo, tabhi stable 15 Mbps+ milega.
+   (15 Mbps = ~1.9 MB/s, ye modest target hai - paid instance par
+   aaram se achieve hota hai.)
+4. Health check: Path "/" , PORT env Koyeb khud set karta hai.
+5. Env variables: API_ID, API_HASH, BOT_TOKEN, SESSION_STRING,
+   PARALLEL_TASKS=3, PROGRESS_EVERY=5
+
+ORDER GUARANTEE (naya fix):
+--------------------------
+- DOWNLOAD parallel hota hai (tez), par UPLOAD hamesha original
+  order me ek-ek karke hota hai. Chhoti file pehle download ho
+  jaye to bhi delivery sequence nahi bigdegi.
+- asyncio.gather result hamesha input ke order me deta hai,
+  isliye sequence safe hai.
+- Files window-wise process hoti hain (PARALLEL_TASKS x 2),
+  taaki disk par zyada load na pade.
+
+SACH BATAUN TO:
+---------------
+- Code tumhara bottleneck hata sakta hai, par FINAL speed hamesha
+  (Koyeb server <-> Telegram DC) ke network par depend karegi.
+  Iski guarantee code se nahi di ja sakti.
+- Userbot wala account us private channel ka MEMBER hona chahiye.
+  Bot ko channel join karne ki zaroorat nahi hai (design pehle se sahi hai).
+- Bahut zyada PARALLEL_TASKS (6+) mat karna, Telegram FloodWait
+  de dega aur ulta slow ho jayega.
