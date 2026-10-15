@@ -34,6 +34,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("VILLAN_BOT")
 
+# Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
+VERSION = "v8"
+
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "").strip()
@@ -1090,6 +1093,7 @@ async def main():
     me = await app.get_me()
     print("========================================", flush=True)
     print(f"👉 BOT LISTENING AS: @{me.username}", flush=True)
+    print(f"👉 VERSION: {VERSION}", flush=True)
     print(f"👉 PARALLEL DOWNLOADS: {PARALLEL_TASKS}x (upload order me)", flush=True)
     print(f"👉 OWNER_ID: {OWNER_ID if OWNER_ID else 'not set (open mode)'}", flush=True)
     print("========================================", flush=True)
