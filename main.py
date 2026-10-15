@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v13"
+VERSION = "v17"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -60,14 +60,92 @@ PROGRESS_EVERY = float(os.environ.get("PROGRESS_EVERY", "5"))
 # Apni ID @userinfobot se le sakte ho. Bot public hai to set karna behtar hai.
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 # Per-user sessions, allowlist aur paid subscriptions ki files
-# (container lifetime tak rehti hain - redeploy par reset)
-SESSIONS_FILE = os.environ.get("SESSIONS_FILE", "sessions.json")
-ALLOWED_FILE = os.environ.get("ALLOWED_FILE", "allowed_users.json")
-SUBS_FILE = os.environ.get("SUBS_FILE", "subscriptions.json")
+# DATA_DIR par rakho taaki Koyeb Volume lage to redeploy par na udein.
+# (Volume: Koyeb dashboard -> Volumes -> Create, mount path /data,
+#  phir env var DATA_DIR=/data set karo. Bina volume ke "." = ephemeral.)
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+SESSIONS_FILE = os.environ.get("SESSIONS_FILE", os.path.join(DATA_DIR, "sessions.json"))
+ALLOWED_FILE = os.environ.get("ALLOWED_FILE", os.path.join(DATA_DIR, "allowed_users.json"))
+SUBS_FILE = os.environ.get("SUBS_FILE", os.path.join(DATA_DIR, "subscriptions.json"))
 # Log group: har user ke naam ka folder (forum topic) yahi banega,
 # aur nikali hui files yahan bhi jayengi (personal ke saath-saath)
 LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "-1004328020590") or 0) or None
-TOPICS_FILE = os.environ.get("TOPICS_FILE", "user_topics.json")
+TOPICS_FILE = os.environ.get("TOPICS_FILE", os.path.join(DATA_DIR, "user_topics.json"))
+# Ek batch me max kitne posts (default 1000; Koyeb env me BATCH_LIMIT se badlo)
+BATCH_LIMIT = max(1, int(os.environ.get("BATCH_LIMIT", "1000")))
+
+# --- BACKUP: redeploy par data bachao (FREE tareeka, Koyeb Eco par bhi) ---
+# Koyeb Volume sirf paid Standard instance par lagta hai. Agar tum free Eco
+# par ho to ye karo: ek PRIVATE channel banao, bot ko usme admin banao,
+# uska ID Koyeb env me BACKUP_CHAT_ID me daalo. Har JSON save ke baad bot
+# uski copy channel me bhej dega; redeploy ke baad jo file local nahi
+# milegi, wo channel se wapas aa jayegi. DATA_DIR/volume wala tareeka bhi
+# saath me chalta rahega — dono me se jo mile, wahi use hoga.
+# NOTE: sessions.json me users ke login session strings hote hain, isliye
+# backup channel HAMESHA private rakho — sirf tum (owner) usme raho.
+try:
+    _raw_backup = os.environ.get("BACKUP_CHAT_ID", "").strip()
+    BACKUP_CHAT_ID = int(_raw_backup) if _raw_backup else None
+except ValueError:
+    BACKUP_CHAT_ID = None
+_BACKUP_KNOWN = ("sessions.json", "allowed_users.json", "subscriptions.json",
+                  "user_settings.json", "user_topics.json")
+_BACKUP_MSG_IDS = {}  # filename -> aakhri backup message id (delete-and-replace)
+
+
+def _backup_caption(fname):
+    return f"backup:{fname}"
+
+
+async def _backup_upload(fname, path):
+    """Local save ke baad backup channel me copy bhejo (best-effort)."""
+    if not BACKUP_CHAT_ID:
+        return
+    try:
+        if not os.path.exists(path):
+            return
+        msg = await app.send_document(BACKUP_CHAT_ID, path,
+                                      caption=_backup_caption(fname))
+        old = _BACKUP_MSG_IDS.get(fname)
+        _BACKUP_MSG_IDS[fname] = msg.id
+        if old and old != msg.id:
+            try:
+                await app.delete_messages(BACKUP_CHAT_ID, old)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"backup upload {fname} failed: {e}", flush=True)
+
+
+async def _backup_restore_all():
+    """Startup par: jo JSON store local nahi hai, use backup channel se lao."""
+    if not BACKUP_CHAT_ID:
+        return
+    stores = {
+        "sessions.json": SESSIONS_FILE,
+        "allowed_users.json": ALLOWED_FILE,
+        "subscriptions.json": SUBS_FILE,
+        "user_settings.json": SETTINGS_FILE,
+        "user_topics.json": TOPICS_FILE,
+    }
+    for fname, path in stores.items():
+        try:
+            if os.path.exists(path):
+                continue
+            cap = _backup_caption(fname)
+            latest = None
+            async for m in app.get_chat_history(BACKUP_CHAT_ID, limit=100):
+                if m.document and (m.caption or "") == cap:
+                    latest = m  # history newest-first: pehla match = latest
+                    break
+            if latest is None:
+                continue
+            await app.download_media(latest, file_name=path)
+            _BACKUP_MSG_IDS[fname] = latest.id
+            print(f"backup restore: {fname}", flush=True)
+        except Exception as e:
+            print(f"backup restore {fname} failed: {e}", flush=True)
 
 # Pyrogram Clients Setup
 app = Client(
@@ -110,6 +188,16 @@ def _save_json(path, data):
             json.dump(data, f)
     except Exception as e:
         print(f"save {path} failed: {e}", flush=True)
+        return
+    # Backup channel set hai to copy wahan bhi bhejo (best-effort, non-blocking)
+    fname = os.path.basename(path)
+    if BACKUP_CHAT_ID and fname in _BACKUP_KNOWN:
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(_backup_upload(fname, path))
+        except Exception:
+            pass
 
 
 def _load_allowed():
@@ -503,8 +591,8 @@ async def _send_by_file_id(client, dest, kind, file_id, caption, info, topic_id=
 
 
 # --- GROUP TOPIC (har user ke naam ka folder) ---
-async def _find_topic(client, channel, title):
-    """Group me title se topic dhoondo. Returns topic_id ya None."""
+async def _find_topic_id(client, channel, title):
+    """Group me title se topic dhoondo. Returns topic ID ya None."""
     from pyrogram import raw
     try:
         res = await client.invoke(raw.functions.channels.GetForumTopics(
@@ -518,15 +606,35 @@ async def _find_topic(client, channel, title):
     return None
 
 
+async def _send_topic_init(client, peer, topic_id, title):
+    """Topic me pehla message bhejo (raw API, top_msg_id se).
+    Returns: message ID (is par reply karne se files usi topic me jayengi)."""
+    from pyrogram import raw
+    import random as _rand
+    try:
+        result = await client.invoke(raw.functions.messages.SendMessage(
+            peer=peer,
+            message=f"📁 **{title}**\nIs user ki files yahan aayengi.",
+            random_id=_rand.randint(1, 2**63 - 1),
+            top_msg_id=topic_id,
+        ))
+        # Updates me se message ID nikalo
+        for update in result.updates:
+            msg = getattr(update, "message", None)
+            if msg and getattr(msg, "id", None):
+                return msg.id
+    except Exception as e:
+        print(f"Topic init message failed: {e}", flush=True)
+    return None
+
+
 async def get_or_create_topic(client, uid):
     """LOG_GROUP me user ke naam ka forum topic (folder). Ek baar banega,
-    phir wahi reuse hoga. Returns topic_id ya None (fail par)."""
+    phir wahi reuse hoga.
+    Returns: message ID (is par reply = file user ke folder me jayegi).
+    Fail par None (to file General me jayegi)."""
     if not LOG_GROUP_ID:
         return None
-    topics = _load_json(TOPICS_FILE, {})
-    key = str(uid)
-    if key in topics:
-        return topics[key]
     try:
         u = await client.get_users(uid)
         title = f"{(u.first_name or 'User')[:25]} • {uid}"
@@ -538,21 +646,30 @@ async def get_or_create_topic(client, uid):
         peer = await client.resolve_peer(LOG_GROUP_ID)
         channel = raw.types.InputChannel(
             channel_id=peer.channel_id, access_hash=peer.access_hash)
-        found = await _find_topic(client, channel, title)
-        if not found:
+        # Topic dhoondo ya banao
+        topic_id = await _find_topic_id(client, channel, title)
+        if not topic_id:
             await client.invoke(raw.functions.channels.CreateForumTopic(
                 channel=channel, title=title,
                 random_id=_rand.randint(1, 2**63 - 1)))
             await asyncio.sleep(1)
-            found = await _find_topic(client, channel, title)
-        if found:
-            topics[key] = found
+            topic_id = await _find_topic_id(client, channel, title)
+        if not topic_id:
+            return _load_json(TOPICS_FILE, {}).get(str(uid))
+        # Topic me pehla message bhejo (ya purana wala use karo)
+        topics = _load_json(TOPICS_FILE, {})
+        stored = topics.get(str(uid))
+        if stored:
+            return stored
+        msg_id = await _send_topic_init(client, peer, topic_id, title)
+        if msg_id:
+            topics[str(uid)] = msg_id
             _save_json(TOPICS_FILE, topics)
-            print(f"Topic ready for {uid}: {found}", flush=True)
-            return found
+            print(f"Topic ready for {uid}: msg={msg_id}", flush=True)
+            return msg_id
     except Exception as e:
         print(f"Topic setup failed: {e}", flush=True)
-    return None
+    return _load_json(TOPICS_FILE, {}).get(str(uid))
 
 
 # --- PHASE 2: DELIVER (personal + group, fast ya slow) ---
@@ -726,8 +843,6 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
 
 
 # --- BATCH RUNNER: SEQUENTIAL (ek-ek karke, fast file_id) ---
-# Har file: pehle metadata lao, phir instant deliver (ya download+upload),
-# personal + group dono jagah. Phir agli file.
 async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
     # Har user ka apna userbot session use hoga
     userbot = await get_userbot(owner_id)
@@ -1032,6 +1147,9 @@ async def batch_start_handler(client, message):
         await message.reply_text("⛔ Tumhe is bot ki permission nahi hai.")
         return
     print(f"⚡ Processing /batch for user {message.chat.id}", flush=True)
+    # Purani adhuri setting-input state ho to hatao, warna batch ka link
+    # galti se setting handler me chala jayega
+    SETTING_STATES.pop(message.chat.id, None)
     USER_STATES[message.chat.id] = {"step": "WAITING_FIRST_LINK"}
     await message.reply_text(
         "🔗 **VILLAN Batch System - Step 1/2**\n\n"
@@ -1217,7 +1335,7 @@ async def handle_login_step(client, message):
 
 
 # --- USER SETTINGS (customize panel) ---
-SETTINGS_FILE = os.environ.get("SETTINGS_FILE", "user_settings.json")
+SETTINGS_FILE = os.environ.get("SETTINGS_FILE", os.path.join(DATA_DIR, "user_settings.json"))
 SETTING_STATES = {}  # uid -> {"action": ...}
 
 DEFAULT_SETTINGS = {
@@ -1649,8 +1767,8 @@ async def message_dispatcher(client, message):
             start_id, end_id = end_id, start_id
 
         total_files = end_id - start_id + 1
-        if total_files > 150:
-            await message.reply_text("⚠️ **Max 150 posts allow hain.**")
+        if total_files > BATCH_LIMIT:
+            await message.reply_text(f"⚠️ **Max {BATCH_LIMIT} posts allow hain.**")
             return
 
         status_msg = await message.reply_text(
@@ -1672,8 +1790,8 @@ async def message_dispatcher(client, message):
             start_id, end_id = end_id, start_id
 
         total = end_id - start_id + 1
-        if total > 150:
-            await message.reply_text("⚠️ **Max 150 posts allow hain.**")
+        if total > BATCH_LIMIT:
+            await message.reply_text(f"⚠️ **Max {BATCH_LIMIT} posts allow hain.**")
             return
 
         status_msg = await message.reply_text(
@@ -1693,10 +1811,16 @@ async def main():
     print("========================================", flush=True)
     print(f"👉 BOT LISTENING AS: @{me.username}", flush=True)
     print(f"👉 VERSION: {VERSION}", flush=True)
-    print("👉 MODE: fast file_id (fallback: sequential download → upload)", flush=True)
-    print(f"👉 LOG GROUP: {LOG_GROUP_ID}", flush=True)
+    print("👉 MODE: sequential (ek download → upload → next)", flush=True)
     print(f"👉 OWNER_ID: {OWNER_ID if OWNER_ID else 'not set (open mode)'}", flush=True)
     print("========================================", flush=True)
+
+    # Redeploy-proof data: backup channel se missing JSON wapas lao
+    if BACKUP_CHAT_ID:
+        print(f"👉 BACKUP_CHAT_ID: {BACKUP_CHAT_ID} (redeploy-proof backup ON)", flush=True)
+        await _backup_restore_all()
+    else:
+        print("👉 BACKUP_CHAT_ID: not set (bina volume ke redeploy par data udega)", flush=True)
 
     await idle()
     await app.stop()
