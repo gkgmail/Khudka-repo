@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v28"
+VERSION = "v31"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -325,6 +325,18 @@ def humanbytes(size):
     return f"{size:.2f} {units[n]}"
 
 
+def _bold_text(text):
+    """Extracted caption/text ko BOLD me convert karo.
+    Pehle markdown special chars escape karo (taaki parse na toote),
+    phir **...** me wrap karo. Content same rahega, sirf bold dikhega."""
+    if not text:
+        return text
+    # Telegram legacy Markdown special chars escape karo
+    for ch in ("\\", "*", "_", "[", "]", "(", ")", "`"):
+        text = text.replace(ch, "\\" + ch)
+    return f"**{text}**"
+
+
 def time_formatter(milliseconds: int) -> str:
     seconds, milliseconds = divmod(int(milliseconds), 1000)
     minutes, seconds = divmod(seconds, 60)
@@ -594,8 +606,9 @@ async def fetch_one(user_client, src_chat, msg_id):
     return info
 
 
-async def download_file(user_client, info, status_msg, stats=None, uid=None, bot_client=None):
-    """Slow path: file ko disk par download karo (settings ya file_id fail par)."""
+async def download_file(user_client, info, prog_msg, stats=None, uid=None, bot_client=None):
+    """Slow path: file ko disk par download karo (settings ya file_id fail par).
+    prog_msg = alag progress message (pinned status_msg se alag)."""
     target_msg = info.get("target_msg")
     msg_id = info["msg_id"]
     if not target_msg or not user_client:
@@ -611,7 +624,7 @@ async def download_file(user_client, info, status_msg, stats=None, uid=None, bot
             file_name=dl_path,
             progress=progress_bar,
             progress_args=(
-                status_msg, start_time, last_update,
+                prog_msg, start_time, last_update,
                 f"📥 Downloading • ID `{msg_id}`", stats, uid, bot_client,
             ),
         )
@@ -932,10 +945,12 @@ async def get_or_create_topic(userbot, uid):
 
 
 # --- PHASE 2: UPLOAD (hamesha ORDER me, ek-ek karke) ---
-async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info, stats=None):
+async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info, stats=None, prog_msg=None):
     """Ek file deliver karo: personal (dest_chat) + group topic (LOG_GROUP_ID).
     FAST PATH: file_id se instant bhejo (no download/upload).
-    SLOW PATH: download karo, settings lagao, phir upload karo."""
+    SLOW PATH: download karo, settings lagao, phir upload karo.
+    status_msg = pinned batch status (sirf _update_batch_status).
+    prog_msg = alag per-file progress message (sirf progress_bar)."""
     kind = info["kind"]
     s = get_settings(uid)
     group_id = LOG_GROUP_ID
@@ -952,12 +967,20 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
                 peer = await client.resolve_peer(group_id)
                 from pyrogram import raw
                 import random as _rand
+                # Bold entity lagao (text me ** markers hain, unko hatake entity banao)
+                entities = None
+                plain = text
+                if text.startswith("**") and text.endswith("**") and len(text) > 4:
+                    plain = text[2:-2]
+                    entities = [raw.types.MessageEntityBold(
+                        offset=0, length=len(plain))]
                 await client.invoke(raw.functions.messages.SendMessage(
-                    peer=peer, message=text,
+                    peer=peer, message=plain,
                     random_id=_rand.randint(1, 2**63 - 1),
-                    top_msg_id=topic_id))
+                    top_msg_id=topic_id, entities=entities))
             else:
-                await client.send_message(group_id, text)
+                await client.send_message(
+                    group_id, text, parse_mode=enums.ParseMode.MARKDOWN)
         except Exception as e:
             print(f"Group text send failed: {e}", flush=True)
 
@@ -969,10 +992,15 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
                 cap = s["caption"].format(filename=info.get("file_name", "file"))
             except Exception:
                 cap = s["caption"]
+        # Extracted caption ko BOLD me convert karo (content same, sirf bold)
+        if cap:
+            cap = _bold_text(cap)
 
         if kind == "text":
-            await client.send_message(dest_chat, info["text"])
-            await _to_group_text(info["text"])
+            bold_text = _bold_text(info["text"])
+            await client.send_message(
+                dest_chat, bold_text, parse_mode=enums.ParseMode.MARKDOWN)
+            await _to_group_text(bold_text)
             return True
         if kind == "too_big":
             await client.send_message(
@@ -1015,7 +1043,7 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
                       flush=True)
 
         # === SLOW PATH: download + settings + upload ===
-        fp = await download_file(userbot, info, status_msg, stats, uid, client)
+        fp = await download_file(userbot, info, prog_msg, stats, uid, client)
         if not fp:
             _clean()
             return False
@@ -1057,10 +1085,12 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
 
         async def _do_send(dchat, dtopic, show_progress):
             kw = {"reply_to_message_id": dtopic} if dtopic else {}
+            # Caption bold hai to parse_mode chahiye
+            cap_kw = {"parse_mode": enums.ParseMode.MARKDOWN} if cap else {}
             if show_progress:
                 last_update = [time.time()]
                 start_time = time.time()
-                pa = (status_msg, start_time, last_update)
+                pa = (prog_msg, start_time, last_update)
                 title = f"🚀 Uploading • ID `{info.get('msg_id')}`"
                 prog = {"progress": progress_bar,
                         "progress_args": pa + (title, stats, uid, client)}
@@ -1071,22 +1101,24 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
                     dchat, video=fp, caption=cap, thumb=th,
                     duration=info.get("duration"),
                     width=info.get("width"), height=info.get("height"),
-                    **prog, **kw)
+                    **prog, **kw, **cap_kw)
             elif send_kind == "document":
                 return await client.send_document(
-                    dchat, document=fp, caption=cap, thumb=th, **prog, **kw)
+                    dchat, document=fp, caption=cap, thumb=th,
+                    **prog, **kw, **cap_kw)
             elif send_kind == "audio":
                 return await client.send_audio(
                     dchat, audio=fp, caption=cap,
                     duration=info.get("duration"),
                     performer=info.get("performer"), title=info.get("title"),
-                    **prog, **kw)
+                    **prog, **kw, **cap_kw)
             elif send_kind == "photo":
-                return await client.send_photo(dchat, photo=fp, caption=cap, **kw)
+                return await client.send_photo(
+                    dchat, photo=fp, caption=cap, **kw, **cap_kw)
             elif send_kind == "voice":
                 return await client.send_voice(
                     dchat, voice=fp, caption=cap,
-                    duration=info.get("duration"), **kw)
+                    duration=info.get("duration"), **kw, **cap_kw)
             elif send_kind == "video_note":
                 return await client.send_video_note(dchat, video_note=fp, **kw)
             else:
@@ -1192,8 +1224,14 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
     except Exception as e:
         print(f"Pin failed: {e}", flush=True)
     try:
-        # Pinned batch status — live update hoga
+        # Pinned batch status — live update hoga (sirf batch overview)
         await _update_batch_status(status_msg, stats, force=True)
+        # ALAG progress message — har file ka download/upload yahan dikhega
+        # (pinned status_msg se alag, taaki dono na ladein)
+        try:
+            prog_msg = await client.send_message(owner_id, "⏳ **Taiyaar...**")
+        except Exception:
+            prog_msg = None
         for mid in ids:
             if cancel_event.is_set():
                 break
@@ -1219,9 +1257,10 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
                 await _update_batch_status(status_msg, stats)
                 continue
             # STEP 2: deliver karo (fast file_id ya download+upload), phir agli file
+            # prog_msg = per-file progress (alag message), status_msg = pinned batch
             ok_one = await upload_one(
                 client, userbot, owner_id, dest_chat, topic_id,
-                status_msg, info, stats)
+                status_msg, info, stats, prog_msg)
             async with stats.lock:
                 stats.done += 1
                 if ok_one:
@@ -1232,6 +1271,12 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
             await _update_batch_status(status_msg, stats)
     finally:
         ACTIVE_BATCHES.pop(owner_id, None)
+        # Progress message saaf karo (pinned status rehne do)
+        if 'prog_msg' in locals() and prog_msg:
+            try:
+                await prog_msg.delete()
+            except Exception:
+                pass
 
     async with stats.lock:
         ok, fail, done = stats.ok, stats.fail, stats.done
@@ -1504,9 +1549,13 @@ async def batch_start_handler(client, message):
     SETTING_STATES.pop(message.chat.id, None)
     USER_STATES[message.chat.id] = {"step": "WAITING_FIRST_LINK"}
     await message.reply_text(
-        "🔗 **VILLAN Batch System - Step 1/2**\n\n"
-        "Kripya **start message ka link** bhejiye jahan se files extract shuru karni hain.\n\n"
-        "*(Cancel karne ke liye `/cancel` likhein)*"
+        "**🔗 VILLAN BATCH SYSTEM**\n"
+        "**━━━━━━━━━━━━━━━**\n"
+        "**STEP 1/2 — Source Selection**\n\n"
+        "**📎 Start message ka link bhejein**\n"
+        "**jahan se extraction shuru karna hai.**\n\n"
+        "**❌ Cancel:** `/cancel`",
+        parse_mode=enums.ParseMode.MARKDOWN,
     )
 
 
@@ -1531,8 +1580,13 @@ async def login_start_handler(client, message):
     await _cleanup_login(uid)
     LOGIN_STATES[uid] = {"step": "PHONE"}
     await message.reply_text(
-        "📱 **Login - Step 1/3**\n\nApna phone number bhejo country code ke saath\n"
-        "(jaise `+919876543210`)\n\nRokne ke liye `/cancel` likho.",
+        "**📱 SECURE LOGIN**\n"
+        "**━━━━━━━━━━━━━━━**\n"
+        "**STEP 1/3 — Phone Number**\n\n"
+        "**📞 Apna phone number bhejein**\n"
+        "**country code ke saath**\n"
+        "**Example:** `+919876543210`\n\n"
+        "**❌ Cancel:** `/cancel`",
         parse_mode=enums.ParseMode.MARKDOWN,
     )
 
@@ -1563,11 +1617,16 @@ async def _finish_login(client, message, st):
 
     name = f"@{me.username}" if me.username else me.first_name
     await message.reply_text(
-        f"✅ **Login successful!** ({name})\n\n"
-        "Tumhara account jud gaya hai. Ab `/batch` bhejo ya channel ka link bhejo, "
-        "files tumhare account se niklegi.\n\n"
-        "⚠️ OTP/password wale messages yahan se delete kar dena.\n"
-        "Logout ke liye `/logout` likho.",
+        "**✅ LOGIN SUCCESSFUL**\n"
+        "**━━━━━━━━━━━━━━━**\n"
+        f"**🎉 Welcome, {name}!**\n\n"
+        "**🔗 Account successfully linked!**\n\n"
+        "**📌 Next Steps:**\n"
+        "**• /batch — Bulk extraction**\n"
+        "**• Channel link — Direct extract**\n\n"
+        "**⚠️ Security: OTP/password wale**\n"
+        "**messages delete kar dein.**\n\n"
+        "**🚪 Logout:** `/logout`",
         parse_mode=enums.ParseMode.MARKDOWN,
     )
     try:
@@ -1629,7 +1688,12 @@ async def handle_login_step(client, message):
             "tmp": tmp,
         })
         await message.reply_text(
-            "📩 **Login - Step 2/3**\n\nTelegram app me aaya hua **OTP** bhejo.",
+            "**📩 VERIFICATION**\n"
+            "**━━━━━━━━━━━━━━━**\n"
+            "**STEP 2/3 — OTP Code**\n\n"
+            "**🔑 Telegram app me aaya hua**\n"
+            "**OTP code bhejein.**\n\n"
+            "**❌ Cancel:** `/cancel`",
             parse_mode=enums.ParseMode.MARKDOWN,
         )
         return
@@ -1654,8 +1718,14 @@ async def handle_login_step(client, message):
         except SessionPasswordNeeded:
             st["step"] = "PASSWORD"
             await message.reply_text(
-                "🔐 **Login - Step 3/3**\n\nIs account par 2-step verification laga hai. "
-                "Apna **password** bhejo.\n\n⚠️ Ye message baad me delete kar dena.",
+                "**🔐 2-STEP VERIFICATION**\n"
+                "**━━━━━━━━━━━━━━━**\n"
+                "**STEP 3/3 — Password**\n\n"
+                "**🛡️ Is account par 2-step verification**\n"
+                "**enabled hai.**\n\n"
+                "**🔑 Apna password bhejein.**\n\n"
+                "**⚠️ Ye message baad me delete kar dein.**\n\n"
+                "**❌ Cancel:** `/cancel`",
                 parse_mode=enums.ParseMode.MARKDOWN,
             )
             return
@@ -1899,8 +1969,12 @@ async def settings_callbacks(client, query):
         await _cleanup_login(uid)
         LOGIN_STATES[uid] = {"step": "PHONE"}
         await query.message.reply_text(
-            "📱 **Login - Step 1/3**\n\nApna phone number bhejo country code ke saath\n"
-            "(jaise `+919876543210`)",
+            "**📱 SECURE LOGIN**\n"
+            "**━━━━━━━━━━━━━━━**\n"
+            "**STEP 1/3 — Phone Number**\n\n"
+            "**📞 Apna phone number bhejein**\n"
+            "**country code ke saath**\n"
+            "**Example:** `+919876543210`",
             parse_mode=enums.ParseMode.MARKDOWN)
     elif data == "st_logout":
         await _cleanup_login(uid)
@@ -2096,7 +2170,15 @@ async def message_dispatcher(client, message):
             "start_id": start_id,
         }
         await message.reply_text(
-            f"✅ **Start Locked:** `{start_id}`\n\nAb **aakhiri (last) link** send karein."
+            "**🔗 VILLAN BATCH SYSTEM**\n"
+            "**━━━━━━━━━━━━━━━**\n"
+            "**STEP 2/2 — Range Complete**\n\n"
+            f"**✅ Start Locked:** `{start_id}`\n\n"
+            "**📎 Ab aakhiri (last) message ka**\n"
+            "**link bhejein jahan tak**\n"
+            "**extraction karna hai.**\n\n"
+            "**❌ Cancel:** `/cancel`",
+            parse_mode=enums.ParseMode.MARKDOWN,
         )
         return
 
