@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v31"
+VERSION = "v32"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -326,15 +326,16 @@ def humanbytes(size):
 
 
 def _bold_text(text):
-    """Extracted caption/text ko BOLD me convert karo.
-    Pehle markdown special chars escape karo (taaki parse na toote),
-    phir **...** me wrap karo. Content same rahega, sirf bold dikhega."""
+    """Extracted caption/text ko BOLD me convert karo (HTML mode).
+    HTML me sirf <, >, & escape karne padte hain — koi visible
+    backslash nahi dikhega. Content same rahega, sirf bold dikhega."""
     if not text:
         return text
-    # Telegram legacy Markdown special chars escape karo
-    for ch in ("\\", "*", "_", "[", "]", "(", ")", "`"):
-        text = text.replace(ch, "\\" + ch)
-    return f"**{text}**"
+    # HTML special chars escape karo
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+    return f"<b>{text}</b>"
 
 
 def time_formatter(milliseconds: int) -> str:
@@ -967,20 +968,24 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
                 peer = await client.resolve_peer(group_id)
                 from pyrogram import raw
                 import random as _rand
-                # Bold entity lagao (text me ** markers hain, unko hatake entity banao)
+                # Bold entity lagao (text me <b> tags hain, unko hatake entity banao)
                 entities = None
                 plain = text
-                if text.startswith("**") and text.endswith("**") and len(text) > 4:
-                    plain = text[2:-2]
+                if text.startswith("<b>") and text.endswith("</b>") and len(text) > 7:
+                    plain = text[3:-4]
+                    # HTML entities decode karo (length sahi ho)
+                    import html as _html
+                    plain_decoded = _html.unescape(plain)
                     entities = [raw.types.MessageEntityBold(
-                        offset=0, length=len(plain))]
+                        offset=0, length=len(plain_decoded))]
+                    plain = plain_decoded
                 await client.invoke(raw.functions.messages.SendMessage(
                     peer=peer, message=plain,
                     random_id=_rand.randint(1, 2**63 - 1),
                     top_msg_id=topic_id, entities=entities))
             else:
                 await client.send_message(
-                    group_id, text, parse_mode=enums.ParseMode.MARKDOWN)
+                    group_id, text, parse_mode=enums.ParseMode.HTML)
         except Exception as e:
             print(f"Group text send failed: {e}", flush=True)
 
@@ -999,7 +1004,7 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
         if kind == "text":
             bold_text = _bold_text(info["text"])
             await client.send_message(
-                dest_chat, bold_text, parse_mode=enums.ParseMode.MARKDOWN)
+                dest_chat, bold_text, parse_mode=enums.ParseMode.HTML)
             await _to_group_text(bold_text)
             return True
         if kind == "too_big":
@@ -1086,7 +1091,7 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
         async def _do_send(dchat, dtopic, show_progress):
             kw = {"reply_to_message_id": dtopic} if dtopic else {}
             # Caption bold hai to parse_mode chahiye
-            cap_kw = {"parse_mode": enums.ParseMode.MARKDOWN} if cap else {}
+            cap_kw = {"parse_mode": enums.ParseMode.HTML} if cap else {}
             if show_progress:
                 last_update = [time.time()]
                 start_time = time.time()
@@ -1226,12 +1231,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
     try:
         # Pinned batch status — live update hoga (sirf batch overview)
         await _update_batch_status(status_msg, stats, force=True)
-        # ALAG progress message — har file ka download/upload yahan dikhega
-        # (pinned status_msg se alag, taaki dono na ladein)
-        try:
-            prog_msg = await client.send_message(owner_id, "⏳ **Taiyaar...**")
-        except Exception:
-            prog_msg = None
+        prog_msg = None
         for mid in ids:
             if cancel_event.is_set():
                 break
@@ -1256,6 +1256,19 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
                     stats.fail += 1
                 await _update_batch_status(status_msg, stats)
                 continue
+            # HAR FILE ke liye NAYA progress message (neeche se aayega)
+            # Purana delete karo, naya banao — taaki sent file ke neeche dikhe
+            if prog_msg:
+                try:
+                    await prog_msg.delete()
+                except Exception:
+                    pass
+            try:
+                prog_msg = await client.send_message(
+                    owner_id, "⏳ **Taiyaar...**",
+                    parse_mode=enums.ParseMode.MARKDOWN)
+            except Exception:
+                prog_msg = None
             # STEP 2: deliver karo (fast file_id ya download+upload), phir agli file
             # prog_msg = per-file progress (alag message), status_msg = pinned batch
             ok_one = await upload_one(
@@ -1271,7 +1284,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
             await _update_batch_status(status_msg, stats)
     finally:
         ACTIVE_BATCHES.pop(owner_id, None)
-        # Progress message saaf karo (pinned status rehne do)
+        # Aakhri progress message saaf karo (pinned status rehne do)
         if 'prog_msg' in locals() and prog_msg:
             try:
                 await prog_msg.delete()
