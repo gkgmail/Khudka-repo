@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v26"
+VERSION = "v27"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -367,6 +367,36 @@ class BatchStats:
         self.fail = 0
         self.start = time.time()
         self.lock = asyncio.Lock()
+        self._last_status_update = 0
+
+
+async def _update_batch_status(status_msg, stats, force=False):
+    """Pinned batch status message ko live update karo (har 3 sec me max 1 baar)."""
+    now = time.time()
+    async with stats.lock:
+        if not force and (now - stats._last_status_update) < 3:
+            return
+        stats._last_status_update = now
+        done, ok, fail, total = stats.done, stats.ok, stats.fail, stats.total
+        elapsed = max(now - stats.start, 1)
+    pct = (done * 100 / total) if total > 0 else 0
+    filled = int(pct // 10)
+    bar = ("🟩" * filled + "⬜" * (10 - filled))
+    # ETA
+    remaining = total - done
+    per_file = elapsed / max(done, 1)
+    eta_s = int(remaining * per_file)
+    eta_str = time_formatter(eta_s * 1000) if done > 0 else "—"
+    text = (
+        "📦 **BATCH STATUS**\n"
+        f"{bar} `{pct:.0f}%`\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"📁 Total: `{total}`\n"
+        f"✅ Done: `{ok}`  ❌ Failed: `{fail}`\n"
+        f"⏱️ ETA: `{eta_str}`\n"
+        "⏹ Cancel: `/cancel`"
+    )
+    await safe_edit(status_msg, text)
 
 
 # --- LIVE PROGRESS TRACKER (file + batch dashboard) ---
@@ -431,7 +461,8 @@ async def progress_bar(
     # UPLOADING ya DOWNLOADING
     op = "UPLOADING" if "Upload" in (action_title or "") else "DOWNLOADING"
 
-    # ━━━ SCREENSHOT WALA PREMIUM STYLE ━━━
+    # ━━━ SHORT PROGRESS BAR (sirf download/upload ke liye) ━━━
+    # Batch line aur premium card YAHAN nahi — wo alag pinned status me hai
     lines = [
         op,
         "",
@@ -444,16 +475,6 @@ async def progress_bar(
         f"┣⪼Message ID: {mid_str}",
         "╰━━━━━━━━━━━━━━━➣",
     ]
-    if stats is not None:
-        async with stats.lock:
-            done, ok, fail, total_b = (
-                stats.done, stats.ok, stats.fail, stats.total,
-            )
-        lines.append(f"📦 Batch: `{done}/{total_b}`  ✅ `{ok}`  ❌ `{fail}`")
-
-    # ⚜️ Premium user data section (helper se)
-    if uid:
-        lines.append(await _premium_card(uid, bot_client))
     await safe_edit(message, "\n".join(lines))
 
 
@@ -492,67 +513,85 @@ async def fetch_one(user_client, src_chat, msg_id):
     if not user_client:
         return "OFFLINE"
 
-    try:
-        target_msg = await _fetch_with_warmup(user_client, src_chat, msg_id)
-        if not target_msg or target_msg.empty:
-            return None
-
-        if not target_msg.media:
-            if target_msg.text:
-                return {"kind": "text", "text": target_msg.text, "msg_id": msg_id}
-            return None
-
-        kind = target_msg.media.value
-        media_obj = getattr(target_msg, kind, None)
-        file_id = getattr(media_obj, "file_id", None) if media_obj else None
-        file_size = getattr(media_obj, "file_size", 0) or 0
-        if file_size > 2097152000:
-            return {"kind": "too_big", "msg_id": msg_id}
-
-        info = {
-            "kind": kind,
-            "msg_id": msg_id,
-            "file_id": file_id,
-            "file_size": file_size,
-            "file_name": os.path.basename(
-                getattr(media_obj, "file_name", "") or f"media_{msg_id}"
-            ),
-            "caption": target_msg.caption or "",
-            "target_msg": target_msg,  # slow path download ke liye
-            "tmpdir": None,
-            "file_path": None,
-            "thumb_path": None,
-        }
-        if target_msg.video:
-            info.update({
-                "duration": target_msg.video.duration,
-                "width": target_msg.video.width,
-                "height": target_msg.video.height,
-            })
-        if target_msg.audio:
-            info.update({
-                "duration": target_msg.audio.duration,
-                "performer": target_msg.audio.performer,
-                "title": target_msg.audio.title,
-            })
-        if target_msg.voice:
-            info.update({"duration": target_msg.voice.duration})
-        return info
-
-    except PeerIdInvalid:
-        return "PEER_INVALID"
-    except ValueError as e:
-        if "Peer id invalid" in str(e):
+    # Retry transient failures (max 3 attempts)
+    last_err = None
+    for attempt in range(3):
+        try:
+            target_msg = await _fetch_with_warmup(user_client, src_chat, msg_id)
+            if not target_msg or target_msg.empty:
+                return None
+            break  # success, exit retry loop
+        except FloodWait as e:
+            wait = e.value + 1
+            print(f"FloodWait on {msg_id}: waiting {wait}s (attempt {attempt+1}/3)", flush=True)
+            await asyncio.sleep(wait)
+            last_err = e
+            continue
+        except (TimeoutError, asyncio.TimeoutError, ConnectionError) as e:
+            last_err = e
+            print(f"Transient error on {msg_id} (attempt {attempt+1}/3): {e}", flush=True)
+            await asyncio.sleep(2 * (attempt + 1))
+            continue
+        except PeerIdInvalid:
             return "PEER_INVALID"
-        raise
-    except (ChannelPrivate, ChatAdminRequired, UserNotParticipant):
-        return "BREAK"
-    except FloodWait as e:
-        await asyncio.sleep(e.value + 1)
+        except ValueError as e:
+            if "Peer id invalid" in str(e):
+                return "PEER_INVALID"
+            raise
+        except (ChannelPrivate, ChatAdminRequired, UserNotParticipant):
+            return "BREAK"
+        except Exception as e:
+            last_err = e
+            print(f"Fetch error on {msg_id} (attempt {attempt+1}/3): {e}", flush=True)
+            await asyncio.sleep(1)
+            continue
+    else:
+        # All 3 attempts failed
+        print(f"Fetch failed after 3 attempts on {msg_id}: {last_err}", flush=True)
         return None
-    except Exception as e:
-        print(f"Fetch error on {msg_id}: {e}", flush=True)
+
+    # Metadata nikalo (fetch already successful)
+    if not target_msg.media:
+        if target_msg.text:
+            return {"kind": "text", "text": target_msg.text, "msg_id": msg_id}
         return None
+
+    kind = target_msg.media.value
+    media_obj = getattr(target_msg, kind, None)
+    file_id = getattr(media_obj, "file_id", None) if media_obj else None
+    file_size = getattr(media_obj, "file_size", 0) or 0
+    if file_size > 2097152000:
+        return {"kind": "too_big", "msg_id": msg_id}
+
+    info = {
+        "kind": kind,
+        "msg_id": msg_id,
+        "file_id": file_id,
+        "file_size": file_size,
+        "file_name": os.path.basename(
+            getattr(media_obj, "file_name", "") or f"media_{msg_id}"
+        ),
+        "caption": target_msg.caption or "",
+        "target_msg": target_msg,  # slow path download ke liye
+        "tmpdir": None,
+        "file_path": None,
+        "thumb_path": None,
+    }
+    if target_msg.video:
+        info.update({
+            "duration": target_msg.video.duration,
+            "width": target_msg.video.width,
+            "height": target_msg.video.height,
+        })
+    if target_msg.audio:
+        info.update({
+            "duration": target_msg.audio.duration,
+            "performer": target_msg.audio.performer,
+            "title": target_msg.audio.title,
+        })
+    if target_msg.voice:
+        info.update({"duration": target_msg.voice.duration})
+    return info
 
 
 async def download_file(user_client, info, status_msg, stats=None, uid=None, bot_client=None):
@@ -1135,12 +1174,8 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
     except Exception as e:
         print(f"Pin failed: {e}", flush=True)
     try:
-        await safe_edit(
-            status_msg,
-            f"📦 **Batch:** `{total}` files — ek-ek karke\n"
-            f"⚡ **Fast mode:** file_id se instant delivery\n"
-            f"⏹ Cancel: `/cancel`",
-        )
+        # Pinned batch status — live update hoga
+        await _update_batch_status(status_msg, stats, force=True)
         for mid in ids:
             if cancel_event.is_set():
                 break
@@ -1163,6 +1198,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
                 async with stats.lock:
                     stats.done += 1
                     stats.fail += 1
+                await _update_batch_status(status_msg, stats)
                 continue
             # STEP 2: deliver karo (fast file_id ya download+upload), phir agli file
             ok_one = await upload_one(
@@ -1174,6 +1210,8 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
                     stats.ok += 1
                 else:
                     stats.fail += 1
+            # Pinned status live update (max 3 sec me 1 baar)
+            await _update_batch_status(status_msg, stats)
     finally:
         ACTIVE_BATCHES.pop(owner_id, None)
 
