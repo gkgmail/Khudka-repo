@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v27"
+VERSION = "v28"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -843,14 +843,16 @@ async def _raw_send_to_topic(client, peer, topic_id, kind, file_id=None,
 
 
 async def _find_topic_id(client, channel, title):
-    """Group me title se topic dhoondo. Returns topic ID ya None."""
+    """Group me title se topic dhoondo. Returns topic ID ya None.
+    Partial match bhi karta hai (uid search ke liye)."""
     from pyrogram import raw
     try:
         res = await client.invoke(raw.functions.channels.GetForumTopics(
             channel=channel, offset_date=0, offset_id=0,
             offset_topic=0, limit=100, q=title))
         for t in res.topics:
-            if t.title == title:
+            # Exact match ya uid/title ka partial match
+            if t.title == title or title in t.title:
                 return t.id
     except Exception as e:
         print(f"Find topic failed: {e}", flush=True)
@@ -887,13 +889,29 @@ async def get_or_create_topic(userbot, uid):
     print(f"[TOPIC] Called for uid={uid}, LOG_GROUP_ID={LOG_GROUP_ID}", flush=True)
     if not LOG_GROUP_ID:
         return None
-    # Pehle stored topic ID check karo
+    # STEP 1: Pehle stored topic ID check karo (fast path)
     topics = _load_json(TOPICS_FILE, {})
     stored = topics.get(str(uid))
     if stored:
         print(f"[TOPIC] Stored topic_id mil gaya: {stored}", flush=True)
         return stored
-    # Naya topic Bot API se banao (bot MTProto se nahi bana sakta!)
+    # STEP 2: Stored nahi hai (redeploy par wipe ho gaya?) —
+    # to group me EXISTING topic search karo (uid se), naya mat banao!
+    # Title format: "{Name} • {uid}" — uid se search karo
+    if userbot:
+        try:
+            peer = await userbot.resolve_peer(LOG_GROUP_ID)
+            # uid string se search karo — title me uid hota hai
+            found_id = await _find_topic_id(userbot, peer, str(uid))
+            if found_id:
+                print(f"[TOPIC] ✅ EXISTING topic mil gaya: {found_id} for uid={uid}", flush=True)
+                topics[str(uid)] = found_id
+                _save_json(TOPICS_FILE, topics)
+                return found_id
+            print(f"[TOPIC] Existing topic nahi mila, naya banayenge", flush=True)
+        except Exception as e:
+            print(f"[TOPIC] Search failed: {e}", flush=True)
+    # STEP 3: Naya topic Bot API se banao (bot MTProto se nahi bana sakta!)
     # Title ke liye user ka naam lao (bot client se, userbot se nahi)
     title = f"User • {uid}"
     try:
