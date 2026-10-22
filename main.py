@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v32"
+VERSION = "v34"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -155,7 +155,7 @@ app = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workers=32,
+    workers=100,
 )
 
 user = None
@@ -165,7 +165,7 @@ if SESSION_STRING and len(SESSION_STRING) > 30:
         api_id=API_ID,
         api_hash=API_HASH,
         session_string=SESSION_STRING,
-        workers=32,
+        workers=100,
     )
 
 USER_STATES = {}
@@ -275,7 +275,7 @@ async def get_userbot(uid):
             api_id=API_ID,
             api_hash=API_HASH,
             session_string=sess,
-            workers=32,
+            workers=100,
         )
         try:
             await asyncio.wait_for(c.start(), timeout=20.0)
@@ -664,27 +664,33 @@ def _needs_file(s, info):
 async def _send_by_file_id(client, dest, kind, file_id, caption, info, topic_id=None):
     """file_id se bhejo — INSTANT, server-side (no download/upload)."""
     kw = {"reply_to_message_id": topic_id} if topic_id else {}
+    # Caption _bold_text() se HTML (<b>...</b>) me aata hai — bina parse_mode
+    # ke Telegram tags ko literal text dikhayega, isliye HTML mode zaroori hai.
+    cap_kw = {"parse_mode": enums.ParseMode.HTML} if caption else {}
     if kind == "video":
         return await client.send_video(
             dest, video=file_id, caption=caption,
             duration=info.get("duration"),
-            width=info.get("width"), height=info.get("height"), **kw)
+            width=info.get("width"), height=info.get("height"),
+            **cap_kw, **kw)
     elif kind == "audio":
         return await client.send_audio(
             dest, audio=file_id, caption=caption,
             duration=info.get("duration"),
-            performer=info.get("performer"), title=info.get("title"), **kw)
+            performer=info.get("performer"), title=info.get("title"),
+            **cap_kw, **kw)
     elif kind == "photo":
-        return await client.send_photo(dest, photo=file_id, caption=caption, **kw)
+        return await client.send_photo(
+            dest, photo=file_id, caption=caption, **cap_kw, **kw)
     elif kind == "voice":
         return await client.send_voice(
             dest, voice=file_id, caption=caption,
-            duration=info.get("duration"), **kw)
+            duration=info.get("duration"), **cap_kw, **kw)
     elif kind == "video_note":
         return await client.send_video_note(dest, video_note=file_id, **kw)
     else:
         return await client.send_document(
-            dest, document=file_id, caption=caption, **kw)
+            dest, document=file_id, caption=caption, **cap_kw, **kw)
 
 
 def _sent_file_id(sent_msg, kind):
@@ -725,6 +731,10 @@ async def _botapi_send_to_topic(kind, file_id=None, file_path=None,
             "message_thread_id": str(topic_id),
             "caption": caption or "",
         }
+        # Caption _bold_text() se HTML (<b>) me hai — bina parse_mode ke
+        # Bot API tags ko literal dikhayega, isliye HTML mode do.
+        if caption:
+            data["parse_mode"] = "HTML"
         files = None
         if kind == "text":
             data = {
@@ -732,6 +742,8 @@ async def _botapi_send_to_topic(kind, file_id=None, file_path=None,
                 "message_thread_id": str(topic_id),
                 "text": caption or "",
             }
+            if caption:
+                data["parse_mode"] = "HTML"
         elif file_id:
             # file_id se instant bhejo
             param = {"video": "video", "audio": "audio", "photo": "photo",
@@ -843,10 +855,21 @@ async def _raw_send_to_topic(client, peer, topic_id, kind, file_id=None,
                     pass
         else:
             return False
+        # Caption _bold_text() se HTML (<b>) me hai — raw API ko tags
+        # hatake bold entity deni padti hai, warna tags literal dikhenge.
+        cap_text = caption or ""
+        cap_entities = None
+        if (cap_text.startswith("<b>") and cap_text.endswith("</b>")
+                and len(cap_text) > 7):
+            import html as _html
+            cap_text = _html.unescape(cap_text[3:-4])
+            cap_entities = [raw.types.MessageEntityBold(
+                offset=0, length=len(cap_text))]
         await client.invoke(raw.functions.messages.SendMedia(
             peer=peer,
             media=media,
-            message=caption or "",
+            message=cap_text,
+            entities=cap_entities,
             random_id=_rand.randint(1, 2**63 - 1),
             top_msg_id=topic_id,
         ))
@@ -858,18 +881,22 @@ async def _raw_send_to_topic(client, peer, topic_id, kind, file_id=None,
 
 async def _find_topic_id(client, channel, title):
     """Group me title se topic dhoondo. Returns topic ID ya None.
-    Partial match bhi karta hai (uid search ke liye)."""
+    Partial match bhi karta hai (uid search ke liye).
+    Do pass: pehle server-side q search, phir bina q ke poori list
+    scan karke title me uid match (q kabhi-kabhi miss kar deta hai)."""
     from pyrogram import raw
-    try:
-        res = await client.invoke(raw.functions.channels.GetForumTopics(
-            channel=channel, offset_date=0, offset_id=0,
-            offset_topic=0, limit=100, q=title))
-        for t in res.topics:
-            # Exact match ya uid/title ka partial match
-            if t.title == title or title in t.title:
-                return t.id
-    except Exception as e:
-        print(f"Find topic failed: {e}", flush=True)
+    for query in (title, ""):
+        try:
+            res = await client.invoke(raw.functions.channels.GetForumTopics(
+                channel=channel, offset_date=0, offset_id=0,
+                offset_topic=0, limit=100, q=query))
+            for t in res.topics:
+                # Exact match ya uid/title ka partial match
+                if t.title == title or title in t.title:
+                    return t.id
+        except Exception as e:
+            print(f"Find topic failed: {e}", flush=True)
+            return None
     return None
 
 
@@ -911,20 +938,29 @@ async def get_or_create_topic(userbot, uid):
         return stored
     # STEP 2: Stored nahi hai (redeploy par wipe ho gaya?) —
     # to group me EXISTING topic search karo (uid se), naya mat banao!
-    # Title format: "{Name} • {uid}" — uid se search karo
-    if userbot:
+    # Title format: "{Name} • {uid}" — uid se search karo.
+    # PEHLE owner ke apne userbot (global `user`) se search karo — wahi
+    # account log group ka member/admin hai. Per-user userbot group me
+    # hota hi nahi, isliye usse search hamesha fail hota tha aur har
+    # redeploy ke baad NAYA folder ban jata tha (duplicate folders bug)!
+    search_clients = []
+    if user is not None:
+        search_clients.append(user)
+    if userbot is not None and userbot is not user:
+        search_clients.append(userbot)
+    for sc in search_clients:
         try:
-            peer = await userbot.resolve_peer(LOG_GROUP_ID)
-            # uid string se search karo — title me uid hota hai
-            found_id = await _find_topic_id(userbot, peer, str(uid))
+            peer = await sc.resolve_peer(LOG_GROUP_ID)
+            found_id = await _find_topic_id(sc, peer, str(uid))
             if found_id:
                 print(f"[TOPIC] ✅ EXISTING topic mil gaya: {found_id} for uid={uid}", flush=True)
                 topics[str(uid)] = found_id
                 _save_json(TOPICS_FILE, topics)
                 return found_id
-            print(f"[TOPIC] Existing topic nahi mila, naya banayenge", flush=True)
         except Exception as e:
             print(f"[TOPIC] Search failed: {e}", flush=True)
+    if search_clients:
+        print(f"[TOPIC] Existing topic nahi mila, naya banayenge", flush=True)
     # STEP 3: Naya topic Bot API se banao (bot MTProto se nahi bana sakta!)
     # Title ke liye user ka naam lao (bot client se, userbot se nahi)
     title = f"User • {uid}"
@@ -1011,6 +1047,7 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
             await client.send_message(
                 dest_chat,
                 f"⚠️ **Message {info['msg_id']}:** File 2GB se badi hai.",
+                parse_mode=enums.ParseMode.MARKDOWN,
             )
             return False
 
@@ -1189,20 +1226,56 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
             shutil.rmtree(info["tmpdir"], ignore_errors=True)
 
 
+async def _pin_status(client, chat_id, msg_id):
+    """Batch status message ko pin karo. Pehle Pyrogram se, fail ho to
+    Bot API se (dono me se ek zaroor kaam karta hai). Returns True/False."""
+    try:
+        await client.pin_chat_message(
+            chat_id, msg_id, disable_notification=True)
+        print("[PIN] Pyrogram pin OK", flush=True)
+        return True
+    except Exception as e:
+        print(f"[PIN] Pyrogram pin fail: {e}", flush=True)
+    if BOT_TOKEN:
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/pinChatMessage"
+            data = {"chat_id": str(chat_id), "message_id": str(msg_id),
+                    "disable_notification": "true"}
+            async with _aiohttp.ClientSession() as sess:
+                async with sess.post(url, data=data, timeout=20) as resp:
+                    result = await resp.json()
+            if result.get("ok"):
+                print("[PIN] Bot API pin OK", flush=True)
+                return True
+            print(f"[PIN] Bot API pin fail: {result}", flush=True)
+        except Exception as e:
+            print(f"[PIN] Bot API pin exception: {e}", flush=True)
+    return False
+
+
 # --- BATCH RUNNER: SEQUENTIAL (ek download -> upload -> next) ---
 # Har file: pehle download karo, turant upload karo, complete.
 # Phir agli file. Koi parallel nahi - har file ko poori bandwidth milti hai
 # aur files ek-ek karke order me milti hain. Disk par 1 se zyada file nahi.
 async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
-    # Har user ka apna userbot session use hoga
+    # PUBLIC source (username wala link, t.me/name/...): login ki zaroorat
+    # NAHI — public channel ko bot khud padh sakta hai, aur bot se fetch
+    # kiya gaya file_id BOT ka apna hota hai, isliye fast path (file_id
+    # instant) bhi kaam karega. Private source (t.me/c/...) ke liye
+    # pehle ki tarah user ka apna userbot session lagega.
+    is_public = isinstance(src_chat, str)
     userbot = await get_userbot(owner_id)
-    if not userbot:
+    if is_public:
+        fetch_client = client  # bot khud fetch/download karega
+    elif not userbot:
         await client.send_message(
             owner_id,
             "❌ **Pehle /login karke apne number se login karo.**",
         )
         await safe_edit(status_msg, "❌ **Login required. Pehle /login karo.**")
         return
+    else:
+        fetch_client = userbot
 
     ids = list(range(start_id, end_id + 1))
     total = len(ids)
@@ -1222,21 +1295,20 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
         "Phir dobara try karo."
     )
 
-    # Status message ko PIN karo taaki upar dikhe
-    try:
-        await client.pin_chat_message(
-            owner_id, status_msg.id, disable_notification=True)
-    except Exception as e:
-        print(f"Pin failed: {e}", flush=True)
+    # Status message ko PIN karo taaki upar dikhe (2 tareeke try honge)
+    pinned = await _pin_status(client, owner_id, status_msg.id)
     try:
         # Pinned batch status — live update hoga (sirf batch overview)
         await _update_batch_status(status_msg, stats, force=True)
+        if not pinned:
+            # Pehli koshish fail hui ho to ek baar aur try karo
+            pinned = await _pin_status(client, owner_id, status_msg.id)
         prog_msg = None
         for mid in ids:
             if cancel_event.is_set():
                 break
             # STEP 1: message ka metadata + file_id lao (download NAHI)
-            info = await fetch_one(userbot, src_chat, mid)
+            info = await fetch_one(fetch_client, src_chat, mid)
             if cancel_event.is_set():
                 break
             if info == "PEER_INVALID":
@@ -1272,7 +1344,7 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
             # STEP 2: deliver karo (fast file_id ya download+upload), phir agli file
             # prog_msg = per-file progress (alag message), status_msg = pinned batch
             ok_one = await upload_one(
-                client, userbot, owner_id, dest_chat, topic_id,
+                client, fetch_client, owner_id, dest_chat, topic_id,
                 status_msg, info, stats, prog_msg)
             async with stats.lock:
                 stats.done += 1
