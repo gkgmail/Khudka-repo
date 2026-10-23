@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v36"
+VERSION = "v37"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -125,9 +125,26 @@ async def _backup_upload(fname, path):
 
 
 async def _backup_restore_all():
-    """Startup par: jo JSON store local nahi hai, use backup channel se lao."""
+    """Startup par: jo JSON store local nahi hai, use backup channel se lao.
+    Bot MTProto se channel history NAHI padh sakta (messages.GetHistory par
+    BOT_METHOD_INVALID aata hai — v36 ke live logs me confirm hua), isliye
+    history scan OWNER ke userbot se hota hai. Upload bot se hi hota hai
+    (channel me post karna bot ke liye allowed hai)."""
     if not BACKUP_CHAT_ID:
         return
+    global _OWNER_UB_STARTED
+    if user is None:
+        print("backup restore SKIP: SESSION_STRING wala owner userbot nahi "
+              "mila — bot akele history nahi padh sakta.", flush=True)
+        return
+    try:
+        if not _OWNER_UB_STARTED:
+            await user.start()
+            _OWNER_UB_STARTED = True
+    except Exception as e:
+        if "already" not in str(e).lower():
+            print(f"backup restore: userbot start fail: {e}", flush=True)
+            return
     stores = {
         "sessions.json": SESSIONS_FILE,
         "allowed_users.json": ALLOWED_FILE,
@@ -141,15 +158,15 @@ async def _backup_restore_all():
                 continue
             cap = _backup_caption(fname)
             latest = None
-            async for m in app.get_chat_history(BACKUP_CHAT_ID, limit=100):
+            async for m in user.get_chat_history(BACKUP_CHAT_ID, limit=100):
                 if m.document and (m.caption or "") == cap:
                     latest = m  # history newest-first: pehla match = latest
                     break
             if latest is None:
                 continue
-            await app.download_media(latest, file_name=path)
+            await user.download_media(latest, file_name=path)
             _BACKUP_MSG_IDS[fname] = latest.id
-            print(f"backup restore: {fname}", flush=True)
+            print(f"backup restore: {fname} OK", flush=True)
         except Exception as e:
             print(f"backup restore {fname} failed: {e}", flush=True)
 
