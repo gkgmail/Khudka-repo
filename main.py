@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v37"
+VERSION = "v38"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -137,12 +137,25 @@ async def _backup_restore_all():
         print("backup restore SKIP: SESSION_STRING wala owner userbot nahi "
               "mila — bot akele history nahi padh sakta.", flush=True)
         return
-    try:
-        if not _OWNER_UB_STARTED:
-            await user.start()
-            _OWNER_UB_STARTED = True
-    except Exception as e:
-        if "already" not in str(e).lower():
+    # Deploy overlap me purana instance kuch der zinda rehta hai — usi
+    # beech userbot start karo to 406 AUTH_KEY_DUPLICATED aata hai.
+    # Isliye 406 par ruko aur dobara try karo (purana instance marne do).
+    for _att in range(4):
+        try:
+            if not _OWNER_UB_STARTED:
+                await user.start()
+                _OWNER_UB_STARTED = True
+            break
+        except Exception as e:
+            es = str(e)
+            if "already" in es.lower():
+                _OWNER_UB_STARTED = True
+                break
+            if "AUTH_KEY_DUPLICATED" in es and _att < 3:
+                print(f"backup restore: 406 duplicate (attempt {_att + 1}/4)"
+                      " — 20s ruk ke dobara try...", flush=True)
+                await asyncio.sleep(20)
+                continue
             print(f"backup restore: userbot start fail: {e}", flush=True)
             return
     stores = {
