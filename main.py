@@ -8,7 +8,7 @@ import asyncio
 import tempfile
 from aiohttp import web
 from pyrogram import Client, filters, idle, enums
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 from pyrogram.errors import (
     FloodWait,
     ChannelPrivate,
@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v34"
+VERSION = "v35"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -73,6 +73,10 @@ SUBS_FILE = os.environ.get("SUBS_FILE", os.path.join(DATA_DIR, "subscriptions.js
 # Log group: har user ke naam ka folder (forum topic) yahi banega,
 # aur nikali hui files yahan bhi jayengi (personal ke saath-saath)
 LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "-1004328020590") or 0) or None
+# v35: Force-join updates channel (@username ya -100... ID). Khali = force join OFF.
+UPDATES_CHANNEL = os.environ.get("UPDATES_CHANNEL", "").strip()
+# v35: /start welcome photo ka URL ya Telegram file_id. Khali = bina photo ke welcome.
+START_IMAGE = os.environ.get("START_IMAGE", "").strip()
 TOPICS_FILE = os.environ.get("TOPICS_FILE", os.path.join(DATA_DIR, "user_topics.json"))
 # Ek batch me max kitne posts (default 1000; Koyeb env me BATCH_LIMIT se badlo)
 BATCH_LIMIT = max(1, int(os.environ.get("BATCH_LIMIT", "1000")))
@@ -1374,60 +1378,239 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
         )
 
 
+
+# --- v35: FORCE-JOIN + WELCOME PANELS (video wale reference bot jaisa) ---
+async def _has_joined(uid):
+    """Force-join check. Channel set na ho ya user owner ho to hamesha True.
+    Check khud fail ho jaye (bot channel me admin nahi, API error) to bhi
+    True — bot is wajah se kabhi band nahi hona chahiye."""
+    if not UPDATES_CHANNEL or _is_owner(uid):
+        return True
+    try:
+        m = await app.get_chat_member(UPDATES_CHANNEL, uid)
+        return m.status in (
+            enums.ChatMemberStatus.OWNER,
+            enums.ChatMemberStatus.ADMINISTRATOR,
+            enums.ChatMemberStatus.MEMBER,
+            enums.ChatMemberStatus.RESTRICTED,
+        )
+    except Exception as e:
+        print(f"[JOIN] check fail uid={uid}: {e}", flush=True)
+        return True
+
+
+def _join_kb():
+    rows = []
+    ch = UPDATES_CHANNEL.lstrip("@")
+    if ch and not ch.lstrip("-").isdigit():
+        rows.append([InlineKeyboardButton(
+            "🤖 JOIN UPDATES CHANNEL 🤖", url=f"https://t.me/{ch}")])
+    rows.append([InlineKeyboardButton(
+        "✅ JOIN KAR LIYA — CHECK KARO", callback_data="home_joined")])
+    return InlineKeyboardMarkup(rows)
+
+
+JOIN_WALL_TEXT = (
+    "**⚠️ Attention ⚠️**\n\n"
+    "**📢 Is bot ko use karne ke liye pehle hamara**\n"
+    "**updates channel join karna hoga!**\n\n"
+    "**✅ Required Action:**\n"
+    "**1. Neeche wale button se channel JOIN karo**\n"
+    "**2. Wapas aakar `/start` dabao ya ✅ button dabao**\n\n"
+    "**🚫 Access restricted until you join!**"
+)
+
+
+async def _send_join_wall(message):
+    if START_IMAGE:
+        try:
+            await message.reply_photo(
+                START_IMAGE, caption=JOIN_WALL_TEXT,
+                parse_mode=enums.ParseMode.MARKDOWN, reply_markup=_join_kb())
+            return
+        except Exception:
+            pass
+    await message.reply_text(
+        JOIN_WALL_TEXT, parse_mode=enums.ParseMode.MARKDOWN,
+        reply_markup=_join_kb())
+
+
+def _welcome_text(uid):
+    has_session = uid in USER_CLIENTS or str(uid) in _load_json(SESSIONS_FILE, {})
+    login = "🟢 Logged in" if has_session else "🔴 Not logged in (/login karo)"
+    access = "✅ Allowed" if _is_allowed(uid) else "⛔ Not allowed"
+    return (
+        "**🚀 Welcome to VILLAN Restriction Bot 🦅**\n\n"
+        "**🌟 *Private/Restricted content save karne ka sabse fast tareeka***\n\n"
+        "**📌 Key Features:**\n"
+        "**- 🛡️ Restriction Bypass — save-restricted videos/files nikalo**\n"
+        "**- ⚡ File-ID Fast Path — supported files bilkul instant**\n"
+        "**- 📦 Bulk Batch — ek saath 1000 tak links**\n"
+        "**- 🔄 Public + Private — dono tarah ke channels**\n"
+        "**- 🎛️ Full Customize — rename, caption, watermark, thumbnail**\n\n"
+        "**🎯 Perfect For:**\n"
+        "**- Course / content collectors 📚**\n"
+        "**- Channel admins 🔄**\n"
+        "**- Limited data wale users 📶**\n\n"
+        f"**🔑 Login:** {login}\n"
+        f"**🛡️ Access:** {access}\n"
+        f"**👑 Owner:** {OWNER_USERNAME}"
+    )
+
+
+def _welcome_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👑 ADMIN PANEL", callback_data="home_admin")],
+        [InlineKeyboardButton("📋 COMMANDS", callback_data="home_commands")],
+        [InlineKeyboardButton("📜 DISCLAIMER", callback_data="home_disclaimer"),
+         InlineKeyboardButton("⚠️ WARNINGS", callback_data="home_warnings")],
+        [InlineKeyboardButton("❌ CLOSE", callback_data="home_close")],
+    ])
+
+
+def _page_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ BACK", callback_data="home_start"),
+         InlineKeyboardButton("❌ CLOSE", callback_data="home_close")],
+    ])
+
+
+COMMANDS_TEXT = (
+    "**📋 COMMANDS**\n\n"
+    "**👤 User Commands:**\n"
+    "**• `/login` — Apne number se login**\n"
+    "**• `/logout` — Session khatam karo**\n"
+    "**• `/batch` — Bulk extraction (range)**\n"
+    "**• `/settings` — Customize panel**\n"
+    "**• `/plan` — Apna plan dekho**\n"
+    "**• `/buy` — Premium kharido**\n"
+    "**• `/help` — Usage guide**\n"
+    "**• `/cancel` — Chal raha task roko**\n"
+    "**• Direct link bhejo — single file extract**\n\n"
+    "**👑 Owner Commands:**\n"
+    "**• `/paid <id> <days>` • `/allow` • `/unallow` • `/users`**"
+)
+
+DISCLAIMER_TEXT = (
+    "**⚖️ Legal Notice**\n\n"
+    "**Ye bot:**\n"
+    "**• Koi file store nahi karta**\n"
+    "**• Kisi illegal activity ko endorse nahi karta**\n"
+    "**• Sirf tools provide karta hai**\n"
+    "**• Users apne actions ke khud zimmedar hain**\n\n"
+    "**Bot use karke tum agree karte ho:**\n"
+    "**• Local laws follow karoge**\n"
+    "**• Copyright material ka abuse nahi karoge**\n"
+    "**• Saare risks tumhare khud ke honge**"
+)
+
+WARNINGS_TEXT = (
+    "**🔞 Safety First!**\n\n"
+    "**🚫 Apna session string kabhi kisi ke saath share mat karo**\n"
+    "**🛡️ Testing ke liye secondary accounts use karo**\n"
+    "**⚖️ Copyright laws ka respect karo**\n"
+    "**💡 Security ke liye saari activities log hoti hain**\n\n"
+    "**❌ Strictly Prohibited:**\n"
+    "**• Child exploitation material**\n"
+    "**• Copyright infringement**\n"
+    "**• Scam / Phishing attempts**\n"
+    "**• Illegal transactions**"
+)
+
+ADMIN_TEXT = (
+    "**👑 ADMIN PANEL**\n\n"
+    "**• `/paid <user_id> <days>` — Premium plan do**\n"
+    "**• `/allow <user_id>` — Lifetime free access**\n"
+    "**• `/unallow <user_id>` — Access hatao**\n"
+    "**• `/users` — Paid + allowed users ki list**\n\n"
+    "**Payment manual hai (UPI) — plan yahi se activate hota hai.**"
+)
+
+
+async def _send_welcome(message, uid):
+    if START_IMAGE:
+        try:
+            await message.reply_photo(
+                START_IMAGE, caption=_welcome_text(uid),
+                parse_mode=enums.ParseMode.MARKDOWN, reply_markup=_welcome_kb())
+            return
+        except Exception:
+            pass
+    await message.reply_text(
+        _welcome_text(uid), parse_mode=enums.ParseMode.MARKDOWN,
+        reply_markup=_welcome_kb())
+
+
+async def _edit_panel(query, text, kb):
+    msg = query.message
+    try:
+        if msg.photo:
+            await msg.edit_caption(
+                text, parse_mode=enums.ParseMode.MARKDOWN, reply_markup=kb)
+        else:
+            await msg.edit_text(
+                text, parse_mode=enums.ParseMode.MARKDOWN, reply_markup=kb)
+    except Exception:
+        pass
+
+
+async def _handle_home_callbacks(client, query, uid, data):
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if data == "home_close":
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        return
+    if data == "home_joined":
+        if await _has_joined(uid):
+            await _edit_panel(query, _welcome_text(uid), _welcome_kb())
+        else:
+            try:
+                await query.answer(
+                    "❌ Abhi bhi join nahi dikh raha. Pehle channel join karo!",
+                    show_alert=True)
+            except Exception:
+                pass
+        return
+    if data == "home_start":
+        await _edit_panel(query, _welcome_text(uid), _welcome_kb())
+        return
+    if data == "home_commands":
+        await _edit_panel(query, COMMANDS_TEXT, _page_kb())
+        return
+    if data == "home_disclaimer":
+        await _edit_panel(query, DISCLAIMER_TEXT, _page_kb())
+        return
+    if data == "home_warnings":
+        await _edit_panel(query, WARNINGS_TEXT, _page_kb())
+        return
+    if data == "home_admin":
+        if _is_owner(uid):
+            await _edit_panel(query, ADMIN_TEXT, _page_kb())
+        else:
+            try:
+                await query.answer("⛔ Ye sirf owner ke liye hai.", show_alert=True)
+            except Exception:
+                pass
+        return
+
+
 # --- BOT HANDLERS ---
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message):
     uid = message.chat.id
     print(f"⚡ Processing /start for user {uid}", flush=True)
-    has_session = uid in USER_CLIENTS or str(uid) in _load_json(SESSIONS_FILE, {})
-    user_status = "🟢 Logged in" if has_session else "🔴 Not logged in (`/login` karo)"
-    access = "✅ Allowed" if _is_allowed(uid) else "⛔ Not allowed"
+    # v35: Force-join gate (UPDATES_CHANNEL set ho tabhi)
+    if not await _has_joined(uid):
+        await _send_join_wall(message)
+        return
+    await _send_welcome(message, uid)
+    return
 
-    start_lines = [
-        "╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮",
-        "┃ 🦅 **VILLAN RESTRICTION BOT** 🦅",
-        "┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫",
-        "┃ ⚡ **Welcome!**",
-        "┃ ",
-        "┃ Main private channels se restricted",
-        "┃ content instantly save karne ke liye ready hoon.",
-        "┃ ",
-        f"┃ 🔑 **Login:** `{user_status}`",
-        f"┃ 🛡️ **Access:** `{access}`",
-        "┃ ⚡ **Mode:** `Fast (file_id instant)`",
-        "┃ ",
-        "┃ 📌 **Commands:**",
-        "┃ • `/login`  - Apne number se login",
-        "┃ • `/batch`  - Range extraction",
-        "┃ • `/settings` - Customize panel",
-        "┃ • `/plan`   - Apna plan dekho",
-        "┃ • `/buy`    - Premium kharido",
-        "┃ • `/help`   - Kaise use karein",
-        "┃ • `/cancel` - Active queue stop",
-        "┃ • Direct link paste karein",
-        "┃ ",
-        f"┃ 👑 **Owner:** `{OWNER_USERNAME}`",
-    ]
-    if _is_owner(uid):
-        start_lines += [
-            "┃ ",
-            "┃ 👑 **Owner:** `/allow` `/paid` `/unallow` `/users`",
-        ]
-    start_lines += [
-        "┃ ",
-        "┃ ⚡ *Ultra-Fast Engine by VILLAN*",
-        "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯",
-    ]
-
-    try:
-        await message.reply_text(
-            "\n".join(start_lines), parse_mode=enums.ParseMode.MARKDOWN
-        )
-    except Exception as e:
-        print(f"Card error: {e}, sending plain fallback...", flush=True)
-        await message.reply_text(
-            f"🦅 VILLAN Bot Active!\nStatus: {user_status}\nSend /batch to start."
-        )
 
 
 @app.on_message(filters.command("cancel") & filters.private)
@@ -1625,6 +1808,9 @@ async def logout_handler(client, message):
 
 @app.on_message(filters.command("batch") & filters.private)
 async def batch_start_handler(client, message):
+    if not await _has_joined(message.chat.id):
+        await _send_join_wall(message)
+        return
     if not _is_allowed(message.chat.id):
         await message.reply_text("⛔ Tumhe is bot ki permission nahi hai.")
         return
@@ -1657,6 +1843,9 @@ async def _cleanup_login(uid):
 @app.on_message(filters.command("login") & filters.private)
 async def login_start_handler(client, message):
     uid = message.chat.id
+    if not await _has_joined(uid):
+        await _send_join_wall(message)
+        return
     if not _is_allowed(uid):
         await message.reply_text(
             "⛔ Tumhe is bot ki permission nahi hai. Owner se contact karo."
@@ -1772,12 +1961,25 @@ async def handle_login_step(client, message):
             "phone_code_hash": sent.phone_code_hash,
             "tmp": tmp,
         })
+        code_type = str(getattr(sent, "type", "") or "")
+        print(f"[LOGIN] code sent -> type={code_type}", flush=True)
+        if "SMS" in code_type:
+            hint = ("**📱 Code SMS se bheja gaya hai —**\n"
+                    "**apne SMS inbox me check karo.**")
+        elif "CALL" in code_type:
+            hint = "**📞 Code CALL par aayega — call ka wait karo.**"
+        else:
+            hint = ("**📱 Code SMS par NAHI aayega!**\n"
+                    "**Telegram app ke andar 'Telegram' naam wali**\n"
+                    "**official chat me aayega.**\n"
+                    "**Jis device me ye number login hai,**\n"
+                    "**wahan chat list me sabse upar dekho.**")
         await message.reply_text(
             "**📩 VERIFICATION**\n"
             "**━━━━━━━━━━━━━━━**\n"
             "**STEP 2/3 — OTP Code**\n\n"
-            "**🔑 Telegram app me aaya hua**\n"
-            "**OTP code bhejein.**\n\n"
+            f"{hint}\n\n"
+            "**🔑 Wo OTP code yahan bhejein.**\n\n"
             "**❌ Cancel:** `/cancel`",
             parse_mode=enums.ParseMode.MARKDOWN,
         )
@@ -2003,6 +2205,9 @@ async def settings_handler(client, message):
 async def settings_callbacks(client, query):
     uid = query.from_user.id
     data = query.data or ""
+    if data.startswith("home_"):
+        await _handle_home_callbacks(client, query, uid, data)
+        return
     if not data.startswith("st_"):
         return
     if not _is_allowed(uid):
@@ -2327,6 +2532,21 @@ async def main():
     await app.start()
 
     me = await app.get_me()
+    try:
+        await app.set_bot_commands([
+            BotCommand("start", "Bot start karo"),
+            BotCommand("login", "Apne number se login"),
+            BotCommand("logout", "Session khatam karo"),
+            BotCommand("batch", "Bulk extraction (range)"),
+            BotCommand("settings", "Customize panel"),
+            BotCommand("plan", "Apna plan dekho"),
+            BotCommand("buy", "Premium kharido"),
+            BotCommand("help", "Usage guide"),
+            BotCommand("cancel", "Chal raha task roko"),
+        ])
+        print("👉 Bot command menu set ho gaya", flush=True)
+    except Exception as e:
+        print(f"[MENU] set_bot_commands fail: {e}", flush=True)
     print("========================================", flush=True)
     print(f"👉 BOT LISTENING AS: @{me.username}", flush=True)
     print(f"👉 VERSION: {VERSION}", flush=True)
