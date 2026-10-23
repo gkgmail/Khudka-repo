@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v35"
+VERSION = "v36"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -580,14 +580,21 @@ async def fetch_one(user_client, src_chat, msg_id):
     if file_size > 2097152000:
         return {"kind": "too_big", "msg_id": msg_id}
 
+    fname = getattr(media_obj, "file_name", "") or ""
+    if not fname:
+        # Photo/voice/sticker jaisi media me file_name hota hi nahi.
+        # Bina extension ke download hui photo ko upload karne par
+        # Telegram PHOTO_EXT_INVALID deta hai (v35 ke live logs me
+        # yahi photo-fail ki asli wajah nikli) — sahi extension lagao.
+        _ext = {"photo": ".jpg", "voice": ".ogg", "video_note": ".mp4",
+                "sticker": ".webp", "animation": ".mp4"}.get(kind, "")
+        fname = f"media_{msg_id}{_ext}"
     info = {
         "kind": kind,
         "msg_id": msg_id,
         "file_id": file_id,
         "file_size": file_size,
-        "file_name": os.path.basename(
-            getattr(media_obj, "file_name", "") or f"media_{msg_id}"
-        ),
+        "file_name": os.path.basename(fname),
         "caption": target_msg.caption or "",
         "target_msg": target_msg,  # slow path download ke liye
         "tmpdir": None,
@@ -635,6 +642,14 @@ async def download_file(user_client, info, prog_msg, stats=None, uid=None, bot_c
         )
         if not file_path or not os.path.exists(file_path):
             return None
+        if info.get("kind") == "photo" and not file_path.lower().endswith(
+                (".jpg", ".jpeg", ".png", ".webp")):
+            # Photo bina sahi extension ke upload nahi hoti (PHOTO_EXT_INVALID)
+            try:
+                os.rename(file_path, file_path + ".jpg")
+                file_path = file_path + ".jpg"
+            except Exception:
+                pass
         info["file_path"] = file_path
         if target_msg.video and target_msg.video.thumbs:
             try:
@@ -1159,8 +1174,16 @@ async def upload_one(client, userbot, uid, dest_chat, topic_id, status_msg, info
                     performer=info.get("performer"), title=info.get("title"),
                     **prog, **kw, **cap_kw)
             elif send_kind == "photo":
-                return await client.send_photo(
-                    dchat, photo=fp, caption=cap, **kw, **cap_kw)
+                try:
+                    return await client.send_photo(
+                        dchat, photo=fp, caption=cap, **kw, **cap_kw)
+                except Exception as e:
+                    if "PHOTO_EXT_INVALID" in str(e):
+                        # Photo ke roop me reject ho jaye to file/document
+                        # bana kar bhej do — image user ko mil hi jayegi
+                        return await client.send_document(
+                            dchat, document=fp, caption=cap, **kw, **cap_kw)
+                    raise
             elif send_kind == "voice":
                 return await client.send_voice(
                     dchat, voice=fp, caption=cap,
