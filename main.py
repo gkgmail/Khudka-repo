@@ -43,7 +43,7 @@ logging.basicConfig(
 logger = logging.getLogger("VILLAN_BOT")
 
 # Code version - startup logs me dikhega taaki pata chale kaunsa code deploy hai
-VERSION = "v38"
+VERSION = "v39"
 
 # --- CONFIGURATION (Koyeb Environment Variables) ---
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -1411,6 +1411,12 @@ async def run_batch(client, owner_id, src_chat, start_id, end_id, status_msg):
                     stats.fail += 1
             # Pinned status live update (max 3 sec me 1 baar)
             await _update_batch_status(status_msg, stats)
+            # FLOOD PACING (v39): har file ke baad 3 sec ka gap — ek hi
+            # bot account se lagatar media bhejne par Telegram SendMedia
+            # FloodWait (jaise 6555 sec wala) laga deta hai. Aakhri file
+            # ke baad gap nahi, taaki batch turant complete ho.
+            if mid != ids[-1]:
+                await asyncio.sleep(3)
     finally:
         ACTIVE_BATCHES.pop(owner_id, None)
         # Aakhri progress message saaf karo (pinned status rehne do)
@@ -2633,3 +2639,4 @@ if __name__ == "__main__":
     # loop capture kar rakha hai. app.run() current (wahi) loop use karta
     # hai, tabhi handlers aur updates sahi chalenge.
     app.run(main())
+
