@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://github.com/user-attachments/assets/fe5bbb08-50ba-470b-a36b-29933787473d" width="400">
+<img width="800" height="300" alt="villan-banner-p10-typewriter" src="https://github.com/user-attachments/assets/032ef820-6ea0-4a79-a5bd-38ef279baba6" />
 
 
 
